@@ -66,7 +66,7 @@ def run_text_llm(prompt: str) -> Dict[str, Any]:
     ollama_url = "http://127.0.0.1:11434/api/generate"
 
     payload = {
-        "model": "qwen3.6:latest",  # 🚨 这里必须填你本地实际运行的模型名字，比如 qwen2.5:72b
+        "model": "qwen3.6:27b",  # 🚨 这里必须填你本地实际运行的模型名字，比如 qwen2.5:72b
         "prompt": prompt,
         "stream": False,
         "options": {
