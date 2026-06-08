@@ -35,4 +35,4 @@ app.include_router(doc_generator.router, prefix="/api/v1/doc_gen", tags=["文书
 
 
 if __name__ == "__main__":
-        uvicorn.run("main:app", host="0.0.0.0", port=8888, reload=True)
+        uvicorn.run("main:app", host="127.0.0.1", port=9000, reload=True)

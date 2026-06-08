@@ -9,6 +9,7 @@ from typing import Dict, Any, List
 from services.vision_extractor import extract_single_document
 from services.screening_engine import ScreeningEngine, CriminalProfile
 from db_manager import get_criminal_dynamic_data
+from services.ocr_locator import OCRLocator
 
 import requests
 import json
@@ -17,6 +18,55 @@ import re
 from PIL import Image
 import io
 
+import base64
+import requests
+import json
+
+
+def call_qwen_vl(image_path: str) -> str:
+    """
+    专门用于长图/复杂图兜底的视觉大模型 (Vision LLM) 调用函数。
+    直接将图片喂给大模型，让大模型“看图说话”提取纯文本。
+    """
+    try:
+        # 1. 读取本地图片并转换为 Base64
+        with open(image_path, "rb") as image_file:
+            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+    except Exception as e:
+        return f"兜底失败：图片文件读取异常 {e}"
+
+    # 2. 组装发给 Ollama 的多模态请求
+    ollama_url = "http://127.0.0.1:11434/api/generate"
+    payload = {
+        "model": "qwen3.6:27b",  # 👈 使用你指定的模型名称
+        "prompt": "你是一个高精度的司法文书文字提取器。请逐字提取这张图片中的所有文字信息，保留原本的段落结构和表格信息。绝对不要解释，不要输出除了图片文字以外的任何废话。",
+        "images": [base64_image],
+        "stream": False,
+        "options": {
+            "temperature": 0.0,  # 🌟 极其重要：设为 0，防止大模型看着图片自己瞎编案情
+            "num_ctx": 4096  # 给足上下文
+        }
+    }
+
+    try:
+        # 3. 发起请求，设置 2 分钟超时
+        response = requests.post(ollama_url, json=payload, timeout=120)
+        response.raise_for_status()
+
+        # 4. 解析大模型的返回结果
+        result_text = response.json().get("response", "").strip()
+
+        # 简单清洗一下可能存在的大模型“废话”
+        if result_text.startswith("好的"):
+            result_text = result_text.split("\n", 1)[-1]
+
+        print(f"✅ Qwen-VL 兜底提取成功！提取了 {len(result_text)} 个字符。")
+        return result_text
+
+    except requests.exceptions.Timeout:
+        return "兜底失败：视觉大模型推理也超时了"
+    except Exception as e:
+        return f"兜底失败：视觉大模型调用异常 {str(e)}"
 
 
 
@@ -89,47 +139,64 @@ class ReviewEngine:
         ]
 
     def _extract_long_image_safe(self, image_path: str, doc_type: str) -> str:
-        """
-        带智能长图切片保护的 OCR 提取器。
-        解决长截图导致的 OCR 接口超时崩溃问题。
-        """
         try:
             with Image.open(image_path) as img:
                 width, height = img.size
-                # 如果是普通的 A4 比例（高宽比 < 2），直接走老逻辑
                 if height / width < 2.0:
-                    return str(extract_single_document(image_path, doc_type, self.criminal_name, mode="模式一"))
+                    return str(extract_single_document(image_path, doc_type, self.criminal_name, mode="纯OCR"))
 
-                # 如果是长图，启动切片逻辑
-                print(f"✂️ [OCR 防御] 检测到长截图 ({width}x{height})，自动启动 A4 比例切片解析...")
-                piece_height = int(width * 1.414)  # 按标准 A4 长宽比例切割
+                print(f"✂️ 检测到长截图，启动【重叠防断行切片】...")
+                # 假设宽度为标准，高度设为宽度的 1.5 倍
+                piece_height = int(width * 1.5)
+                overlap = int(width * 0.15)  # 🌟 核心：15% 的像素重叠，绝对不会再把字拦腰切断！
+
                 extracted_texts = []
-
-                for i in range(0, height, piece_height):
-                    # 定义切割盒子 (left, upper, right, lower)
+                # 步长为 piece_height - overlap
+                for i in range(0, height, piece_height - overlap):
                     box = (0, i, width, min(i + piece_height, height))
                     piece = img.crop(box)
-
-                    # 保存临时切片
                     temp_piece_path = f"{image_path}_piece_{i}.jpg"
                     piece.convert("RGB").save(temp_piece_path, "JPEG")
 
-                    try:
-                        # 把 mode 修改为 "纯OCR"
-                        text = extract_single_document(temp_piece_path, doc_type, self.criminal_name, mode="纯OCR")
-                        extracted_texts.append(str(text))
-                    except Exception as e:
-                        print(f"❌ 切片 {i} 提取失败: {e}")
-                    finally:
-                        # 阅后即焚，清理临时切片
-                        if os.path.exists(temp_piece_path):
-                            os.remove(temp_piece_path)
+                    # 1. 尝试使用常规纯OCR直通车提取
+                    print(f"⏳ 正在使用常规 OCR 解析切片 {i}...")
+                    text = extract_single_document(temp_piece_path, doc_type, self.criminal_name, mode="纯OCR")
 
-                # 将切片文本拼接成完整的长文返回
-                return "\n---切片接缝---\n".join(extracted_texts)
+                    # 2. 🌟 综合判定 OCR 是否真的失败了（这三道防线缺一不可）
+                    is_ocr_failed = False
+                    text_str = str(text)
 
+                    # 防线一：如果返回的是一个字典，且字典里包含了报错关键词
+                    if isinstance(text, dict):
+                        error_keywords = ["异常", "报错", "失败", "超时", "error", "Timeout"]
+                        if any(kw in text_str for kw in error_keywords):
+                            is_ocr_failed = True
+
+                    # 防线二：如果返回内容特别短（说明提取出来的全是空白）
+                    elif len(text_str.strip()) < 20:
+                        is_ocr_failed = True
+
+                    # 防线三：包含 requests 库的典型断连报错字符串
+                    elif "Read timed out" in text_str or "ConnectionPool" in text_str:
+                        is_ocr_failed = True
+
+                    # 3. 🚨 触发多模态视觉大模型兜底！
+                    if is_ocr_failed:
+                        print(f"⚠️ 切片 {i} 常规 OCR 彻底崩溃/超时！正在呼叫 Qwen 多模态视觉大脑强行突围...")
+                        # 👈 调用我们刚写的兜底函数
+                        text = call_qwen_vl(temp_piece_path)
+
+                    extracted_texts.append(str(text))
+
+                    # 阅后即焚
+                    if os.path.exists(temp_piece_path):
+                        os.remove(temp_piece_path)
+
+                    extracted_texts.append(str(text))
+                    os.remove(temp_piece_path)
+
+                return "\n---(重叠切片接缝)---\n".join(extracted_texts)
         except Exception as e:
-            print(f"⚠️ 图片预处理失败: {e}")
             return f"图片解析异常: {str(e)}"
 
     def _fetch_raw_archives(self, force_refresh: bool = False) -> Dict[str, str]:
@@ -275,13 +342,22 @@ class ReviewEngine:
             engine = ScreeningEngine(profile)
             result = engine.run_screening()
             if result.get("is_qualified"):
-                return result.get("recommended_reduction", "系统判定符合，但未返回幅度")
+                return {
+                    "reduction": result.get("recommended_reduction", "系统判定符合，但未返回幅度"),
+                    "reasoning": result.get("legal_reasoning", "无详细推演步骤")
+                }
             else:
-                return f"模块2判定不具备减刑资格: {result.get('legal_reasoning')}"
+                return {
+                    "reduction": "不符合提请条件",
+                    "reasoning": result.get('legal_reasoning', "条件不符")
+                }
 
         except Exception as e:
             traceback.print_exc()
-            return "减刑幅度无法自动测算（系统参数缺失）"
+            return {
+                "reduction": "测算异常",
+                "reasoning": f"减刑幅度无法自动测算（系统参数缺失或报错: {str(e)}）"
+            }
 
     def run_review(self, approval_img_paths: List[str], eval_img_paths: List[str],
                    force_refresh_archive: bool = False) -> Dict[str, Any]:
@@ -292,22 +368,25 @@ class ReviewEngine:
         if not raw_archives:
             return {"error": f"在 Prison_Archives/{self.criminal_name} 目录下未读取到有效的卷宗扫描件。"}
 
-        # 2. 预测幅度
-        expected_reduction = self._get_expected_reduction()
+        # 2. 预测幅度及获取法理推演明细 (🌟这里只调用一次)
+        expected_data = self._get_expected_reduction()
+        expected_reduction = expected_data.get("reduction", "未知幅度")
+        legal_reasoning = expected_data.get("reasoning", "无法理推演过程")
 
-        # 3. 提取待审表单
-        print("👁️ [Review] 正在解析本次提交的待审表单...")
+        # 3. 提取待审表单 (🌟 这里换装搭载坐标定位雷达的 OCRLocator)
+        print("👁️ [Review] 正在解析待审表单并建立空间坐标系...")
+        locator = OCRLocator()
         approval_texts = []
         for path in approval_img_paths:
-            # 修改为 纯OCR
-            res = self._extract_long_image_safe(path, "审批表页")  # 确保这个方法里面传的是"纯OCR"
-            approval_texts.append(json.dumps(res, ensure_ascii=False))
+            # 提取文本，坐标字典我们直接画图时再提，先只拿文本送给大模型
+            text, _ = locator.extract_with_boxes(path)
+            approval_texts.append(text)
 
         eval_texts = []
         for path in eval_img_paths:
-            # 替换为带切片保护的新方法
-            res = self._extract_long_image_safe(path, "评议表页")
-            eval_texts.append(json.dumps(res, ensure_ascii=False))
+            text, _ = locator.extract_with_boxes(path)
+            eval_texts.append(text)
+
 
         # ---------------- 核心业务审查规则库 ----------------
         review_prompt = f"""
@@ -354,6 +433,12 @@ class ReviewEngine:
         12. **有效奖惩规则**：（1）奖励栏中【绝对不能】出现“物质奖励”；（2）死缓期间获得的奖励（与减为无期前的时间有重叠的）【严禁出现】在本次提请中；（3）奖励一般每6个月一次，根据本次表单提请日期推算，判断是否“漏录”了最新的奖励。
         13. **评议表与财产规定**：财产性判项严格区分“履行完毕”、“终结执行”、“终结本次执行程序”，必须与档案扫描件原汁原味对照！评议表中若写“XX年度狱级改造积极分子”，XX必须是获奖时间的【前一年】。
 
+        【重要强制批注指令】：为了能在原图上模仿人类警官“批改卷宗”，你必须在 JSON 的每一个检查项中新增一个 "keyword_in_image" 字段。
+        该字段必须【一字不差】地提取自你核对的那行 OCR 文本原文！
+        - 如果该项【异常/疑点】，提取写错的那个词（如档案是四川省，表单是四川，提取“四川”）。
+        - 如果该项【通过】，提取表单上该栏目最核心的那个正确对账词（例如核对财产完全正确，提取“履行完毕”；核对前科正确，提取“累犯”）。
+        如果在图上找不到对应文字或留空，请填 "无"。
+        
         请输出严格合法的 JSON，只输出 JSON，不要输出 Markdown 标记，确保 Python 能直接解析：
         {{
             "基本身份信息": {{"status": "通过" 或 "异常", "error": "...", "suggestion": "..."}},
@@ -367,6 +452,33 @@ class ReviewEngine:
         }}
         """
 
-        print("🧠 [Review] 正在调度本地大模型进行深度逻辑比对 (狱政高频易错点专项扫雷)...")
         review_result = run_review_llm(review_prompt)
+        review_result["法定幅度推演明细"] = legal_reasoning
+
+        # 🌟 4. 新增：自动画图拦截逻辑 (支持红圈、黄三角、绿对勾) 🌟
+        print("🎨 [Review] 正在将大模型批注反馈至坐标空间...")
+
+        annotations_to_draw = []
+        for key, value in review_result.items():
+            if isinstance(value, dict):
+                # 兼容不同命名
+                keyword = value.get("keyword_in_image") or value.get("error_keyword_in_image")
+                status = value.get("status")
+
+                # 只要大模型提取了字，且字不是"无"，我们就画图批注
+                if keyword and keyword != "无":
+                    annotations_to_draw.append({
+                        "keyword": keyword,
+                        "status": status
+                    })
+
+        # 渲染批改后的图片
+        annotated_image_paths = []
+        for path in approval_img_paths + eval_img_paths:
+            output_path = f"{path}_annotated.jpg"
+            locator.draw_annotations(path, annotations_to_draw, output_path)
+            annotated_image_paths.append(output_path)
+
+        review_result["annotated_images"] = annotated_image_paths
+
         return review_result

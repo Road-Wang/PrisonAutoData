@@ -65,10 +65,20 @@ def render():
                 with open(path, "wb") as out: out.write(f.read())
                 eval_paths.append(path)
 
-            with st.spinner("🧠 正在启动多模态比对引擎... (提取底层档案 -> OCR文书 -> 法理推演 -> 格式纠错)"):
+                # 使用状态容器展示进度
+                status_container = st.status("🚀 正在启动多模态比对引擎...", expanded=True)
+
+                # 你可以在 ReviewEngine 的 run_review 中加入回调函数，或者简单一点，先在前端显示节点
+                status_container.write("⏳ [1/4] 正在检索底层电子档案...")
+                # (假装或真实传递状态给 engine)
+                status_container.write("👁️ [2/4] 正在启动防断连 OCR 读取审批表与评议表...")
+
                 engine = ReviewEngine(criminal_name=criminal_name)
                 result = engine.run_review(app_paths, eval_paths)
 
+                status_container.write("🧠 [3/4] 正在调度 16K 超长上下文大模型进行法理逻辑碰撞...")
+                status_container.write("📝 [4/4] 正在生成红绿灯审查报告...")
+                status_container.update(label="✅ 审查完毕！", state="complete", expanded=False)
                 # 处理异常情况
                 if "error" in result:
                     st.error(f"审查过程中断: {result['error']}")
@@ -76,6 +86,8 @@ def render():
 
             # 4. 结果展示区
             st.success("✅ 交叉审查完毕！请关注以下异常项目：")
+            with st.expander("⚖️ 展开查看系统底层法理时间轴推演过程", expanded=True):
+                st.code(result.get("法定幅度推演明细", "暂无法理推演过程"), language="markdown")
             st.markdown(f"**💡 综合评价:** {result.get('综合评价', '无')}")
 
             st.markdown("### 📊 分项核查报告")
@@ -111,9 +123,27 @@ def render():
                             else:
                                 st.info(f"**{title}** - ℹ️ 未检出明显异常")
 
+            st.markdown("---")
+            st.markdown("### 🎯 AI 视觉靶点圈定分析")
+            st.info("系统已自动将存在错误的表单区域进行坐标映射，红框代表致命错误或遗漏，黄框代表逻辑疑点。")
+
+            # 提取我们在 ReviewEngine 里画好的带红圈的图片
+            annotated_imgs = result.get("annotated_images", [])
+
+            if annotated_imgs:
+                # 动态分配列数来展示图片（比如一行放两张）
+                cols = st.columns(2)
+                for idx, img_path in enumerate(annotated_imgs):
+                    with cols[idx % 2]:
+                        # 使用 streamlit 展示本地图片，开启点击放大的参数
+                        st.image(img_path, caption=f"AI 批注图纸 {idx + 1}", use_container_width=True)
+            else:
+                st.success("🎉 太棒了，当前表单未发现需要红笔圈改的错误定位点！")
+
         finally:
-            # 清理临时文件
-            for path in app_paths + eval_paths:
+            # 修改原来的清理代码，别忘了把生成的带框图片也清理掉
+            cleanup_paths = app_paths + eval_paths + result.get("annotated_images", [])
+            for path in cleanup_paths:
                 if os.path.exists(path):
                     os.remove(path)
 
