@@ -32,6 +32,18 @@ def encode_image_to_base64(image_path: str, max_size=1600):
 def extract_single_document(image_path: str, doc_name: str, target_name: str, previous_doc_type: str = "无",
                             mode: str = "模式一", doc_category: str = "", extra_prompt: str = "", batch_name: str = "",
                             batch_type: str = ""):
+    # ====== 🌟 核心升级 1：旁路缓存拦截机制 ======
+    # 只要这个图片按这个模式被处理过，直接秒速读取，拒绝重复劳动！
+    cache_file = f"{image_path}.{mode}.cache.json"
+    if os.path.exists(cache_file):
+        print(f"⚡ [Cache Hit] 命中本地缓存，跳过全部大模型推理，瞬间加载: {doc_name}")
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ 缓存损坏，系统将重新解析: {e}")
+    # ============================================
+
     print(f"\n" + "=" * 50)
     print(f"🎬 开始处理卷宗: 【{doc_name}】 (业务模式: {mode})")
     print(f"=" * 50)
@@ -40,7 +52,7 @@ def extract_single_document(image_path: str, doc_name: str, target_name: str, pr
         print(f"[{doc_name}] ⏳ [1/4] 正在读取本地图片并转码 Base64...")
         base64_image = encode_image_to_base64(image_path)
     except Exception as e:
-        print(f"[{doc_name}] ❌ [1/4] 崩溃：图片读取失败！\n报错详情: {e}")
+        print(f"[{doc_name}] ❌ 崩溃：图片读取失败！\n报错详情: {e}")
         return {"文书类别": "系统错误", "其他信息": "图片读取或转码失败"}
 
     print(f"👁️ 正在启动 DeepSeek-OCR 像素剥离: {doc_name}...")
@@ -52,39 +64,43 @@ def extract_single_document(image_path: str, doc_name: str, target_name: str, pr
             "prompt": "请仔细提取图片中的所有文字内容，不要输出废话和坐标格式。",
             "images": [base64_image],
             "stream": False,
-            "keep_alive": "10m",  # 🌟 核心防断连：保留 10 分钟
+            "keep_alive": 0,
             "options": {"temperature": 0.1, "top_p": 0.5}
         }
-    except Exception as e:
-        return {"文书类别": "系统错误", "其他信息": "请求构造异常"}
-
-    print(f"[{doc_name}] 🚀 [3/4] 正在向本地 Ollama 发送推理请求...")
-    try:
         ocr_response = requests.post(OLLAMA_VISION_URL, json=ocr_payload, timeout=120)
         if ocr_response.status_code == 200:
             raw_ocr_text = ocr_response.json().get("response", "").strip()
             ocr_cost = time.time() - ocr_start_time
             print(f"[{doc_name}] ⚡ [3/4] 接口响应成功！网络耗时: {ocr_cost:.1f} 秒。")
 
-            try:
-                clean_text = re.sub(r'<\|.*?\|>', '', raw_ocr_text)
-                clean_text = re.sub(r'\[\[.*?\]\]', '', clean_text)
-                fluff_patterns = [r"^好的[，。！,!\s]*", r"^以下是.*?[:：\n]", r"以上内容[为是已].*?[。！!]",
-                                  r"按照您?[的]?要求.*?[。！!]", r"没有包含任何.*?[。！!]", r"这是图片中.*?[。！!]"]
-                for pattern in fluff_patterns:
-                    clean_text = re.sub(pattern, '', clean_text, flags=re.MULTILINE)
-                clean_text = clean_text.strip()
+            clean_text = re.sub(r'<\|.*?\|>', '', raw_ocr_text)
+            clean_text = re.sub(r'\[\[.*?\]\]', '', clean_text)
+            fluff_patterns = [r"^好的[，。！,!\s]*", r"^以下是.*?[:：\n]", r"以上内容[为是已].*?[。！!]",
+                              r"按照您?[的]?要求.*?[。！!]", r"没有包含任何.*?[。！!]", r"这是图片中.*?[。！!]"]
+            for pattern in fluff_patterns:
+                clean_text = re.sub(pattern, '', clean_text, flags=re.MULTILINE)
+            clean_text = clean_text.strip()
+            print(f"[{doc_name}] ✅ OCR 成功！提取 {len(clean_text)} 个字符。")
 
-                if len(clean_text) < 50:
-                    print(f"[{doc_name}] ❌ OCR 异常：字数过少。")
-                    return {"文书类别": "提取失败_无文字", "其他信息": "OCR未能提取到有效案卷文本"}
-                print(f"[{doc_name}] ✅ OCR 成功！提取 {len(clean_text)} 个字符。")
-            except Exception as e:
-                return {"文书类别": "系统错误", "其他信息": "后处理逻辑报错"}
         else:
             return {"文书类别": "OCR_引擎报错", "其他信息": f"状态码: {ocr_response.status_code}"}
     except Exception as e:
         return {"文书类别": "OCR_请求异常", "其他信息": str(e)}
+
+    # ====== 🌟 核心升级 2：纯OCR直通车 ======
+    # 如果指定了纯OCR模式，提取完文字直接跑路，彻底封杀耗时的逻辑大脑！
+    if mode == "纯OCR":
+        print(f"🚀 [提速直通车] 已跳过逻辑大脑解析，直接交付纯净文本。")
+        result = {"文书类别": "原始扫描文本", "提取内容": clean_text}
+
+        # 存入缓存
+        try:
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        return result
 
     # ==========================================
     # 🧠 第二步：呼叫 Qwen 主审大脑 (动态分流 Prompt)
@@ -224,7 +240,15 @@ def extract_single_document(image_path: str, doc_name: str, target_name: str, pr
             clean_str_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
             clean_str = clean_str_match.group(0) if clean_str_match else "{}"
             try:
-                return json.loads(clean_str)
+                result_json = json.loads(clean_str)
+                # ====== 🌟 核心升级 3：存入缓存 ======
+                try:
+                    with open(cache_file, 'w', encoding='utf-8') as f:
+                        json.dump(result_json, f, ensure_ascii=False, indent=2)
+                except Exception as ce:
+                    print(f"⚠️ 缓存写入失败: {ce}")
+                # ====================================
+                return result_json
             except json.JSONDecodeError:
                 print(f"⚠️ {doc_name} JSON格式崩溃！")
                 return {"文书类别": "格式崩溃_需人工核查", "系统提示": "模型JSON崩溃，提取原文本：",
