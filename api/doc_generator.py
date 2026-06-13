@@ -291,3 +291,21 @@ async def generate_and_save_doc(payload: SaveDocPayload):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"文书模板渲染异常: {str(e)}")
+
+
+# ==========================================
+# 🚀 接口3：快捷获取罪犯编号 (新增)
+# ==========================================
+@router.get("/get_criminal_info")
+async def get_criminal_info(name: str):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        # 提取 criminal_number 字段
+        cursor.execute("SELECT criminal_number FROM criminals_v5 WHERE criminal_name = ? ORDER BY id DESC LIMIT 1", (name,))
+        row = cursor.fetchone()
+        conn.close()
+        return {"criminal_number": row[0] if row and row[0] else ""}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询档案编号失败: {str(e)}")
+
