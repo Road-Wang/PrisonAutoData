@@ -6,8 +6,9 @@ from openpyxl.styles import Font, Alignment, Border, Side
 from urllib.parse import quote
 import traceback
 from docx import Document
-from docx.shared import Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+from docx.enum.table import WD_ROW_HEIGHT_RULE
 from docx.oxml.ns import qn
 router = APIRouter()
 
@@ -197,105 +198,183 @@ async def generate_income_expense_doc(
         old_bytes = await old_file.read()
         new_bytes = await new_file.read()
 
-        # ==================== 解析【旧系统账单】(终极暴力解码器 V2) ====================
+        # ==================== 解析【旧系统账单】(终极二进制正则粉碎机 V4.1 余额排除版) ====================
         def parse_old(contents, filename):
+            # try:
+            #     df = None
+            #
+            #     # 🚨 拦截点 1: 嗅探老版二进制 Excel (.xls) 伪装
+            #     # 检查 OLE2 复合文档的 16 进制 Magic Number
+            #     if contents.startswith(b'\xd0\xcf\x11\xe0'):
+            #         try:
+            #             import xlrd
+            #         except ImportError:
+            #             raise Exception(
+            #                 "系统检测到该 .frp 实际上是老版的 Excel (.xls) 文件。但您的服务器环境中未安装 `xlrd` 库！请在控制台执行 `pip install xlrd` 后再试，或者先将其用电脑 Excel 另存为 .xlsx 后上传！")
+            #
+            #         df = pd.read_excel(io.BytesIO(contents), engine='xlrd')
+            #
+            #     # 🚨 拦截点 2: 嗅探新版压缩 Excel (.xlsx) 伪装
+            #     elif contents.startswith(b'PK\x03\x04'):
+            #         try:
+            #             import openpyxl
+            #         except ImportError:
+            #             raise Exception("系统缺少读取 .xlsx 的 openpyxl 库，请执行 `pip install openpyxl`。")
+            #
+            #         df = pd.read_excel(io.BytesIO(contents), engine='openpyxl')
+            #
+            #     # 兜底尝试标准解析
+            #     if df is None or df.empty:
+            #         try:
+            #             df = pd.read_excel(io.BytesIO(contents))
+            #         except:
+            #             pass
+            #
+            #     # 🚨 拦截点 3: 尝试全编码覆盖的文本强解
+            #     if df is None or df.empty:
+            #         text = None
+            #         # 加入了老系统极爱用的 utf-16 (Unicode文本) 和 utf-8-sig (带BOM)
+            #         for enc in ['utf-8-sig', 'utf-16', 'utf-16le', 'gb18030', 'gbk', 'utf-8']:
+            #             try:
+            #                 text = contents.decode(enc)
+            #                 break
+            #             except:
+            #                 pass
+            #
+            #         # 如果各种正规解码都失败了，强行忽略错误读取，绝不抛出“无法识别结构”
+            #         if not text:
+            #             text = contents.decode('gb18030', errors='ignore')
+            #
+            #         # 尝试 HTML 表格读取 (防范伪装网页)
+            #         if '<table' in text.lower() or '<worksheet' in text.lower():
+            #             try:
+            #                 tables = pd.read_html(io.StringIO(text))
+            #                 if tables: df = tables[0]
+            #             except:
+            #                 pass
+            #
+            #         # 手撕不规则文本（核心抹平术）
+            #         if df is None or df.empty:
+            #             lines = text.splitlines()
+            #             if lines:
+            #                 # 灵活探测分隔符
+            #                 sample = "\n".join(lines[:20])
+            #                 sep = '\t' if sample.count('\t') > sample.count(',') else ','
+            #
+            #                 raw_data = [line.split(sep) for line in lines]
+            #                 if raw_data:
+            #                     # 核心抹平：强行把短的行补齐到最大列数，彻底解决脏表头崩溃
+            #                     max_cols = max(len(row) for row in raw_data)
+            #                     padded_data = [row + [''] * (max_cols - len(row)) for row in raw_data]
+            #                     df = pd.DataFrame(padded_data)
+            #
+            #     if df is None or df.empty:
+            #         raise Exception("文件解析彻底失败。该文件既不是 Excel 也不是规整的文本，请确认文件是否已损坏。")
+            #
+            #     # ================= 动态寻址真表头 (避开所有脏标题) =================
+            #     header_idx = -1
+            #     for i in range(min(50, len(df))):
+            #         # 只有同时包含三大金刚，才是真表头
+            #         row_str = "".join([str(x).strip() for x in df.iloc[i].values if pd.notna(x)])
+            #         if '项目' in row_str and '增' in row_str and '减' in row_str:
+            #             header_idx = i
+            #             break
+            #
+            #     if header_idx == -1:
+            #         # 💡 杀手锏：如果找不到表头，把读出来的前五行强行弹到前端页面上给你看
+            #         preview_data = df.head(5).values.tolist()
+            #         raise Exception(
+            #             f"文件结构读取成功，但并未在数据中找到包含【项目】、【增】、【减】的真表头行！提取到的前五行预览: {preview_data}")
+            #
+            #     # 提取并清理列名 (防止空列名导致 DataFrame 报错)
+            #     raw_columns = [str(c).strip() for c in df.iloc[header_idx].values]
+            #     safe_columns = []
+            #     for idx, col in enumerate(raw_columns):
+            #         safe_columns.append(f"Unnamed_{idx}" if col in ["", "nan", "None"] else col)
+            #
+            #     df.columns = safe_columns
+            #     df = df.iloc[header_idx + 1:].copy()
+            #     df = df.loc[:, ~df.columns.duplicated()]
+            #
+            #     if '项目' not in df.columns or '增' not in df.columns or '减' not in df.columns:
+            #         raise Exception(f"列名挂载失败，请检查文件内容，当前提取到的列名：{list(df.columns)}")
+            #
+            #     # ================= 数值清洗与汇算 =================
+            #     df['增'] = pd.to_numeric(df['增'], errors='coerce').fillna(0)
+            #     df['减'] = pd.to_numeric(df['减'], errors='coerce').fillna(0)
+            #     df['项目'] = df['项目'].astype(str).fillna("")
+            #
+            #     in_inc = df[df['项目'].str.contains('零花钱|劳动奖金')]['增'].sum()
+            #     out_inc = df[df['项目'].str.contains('会见款|存入汇款')]['增'].sum()
+            #     shopping = df[df['项目'].str.contains('消费')]['减'].sum()
+            #     phone = df[df['项目'].str.contains('亲情电话')]['减'].sum()
             try:
                 df = None
 
                 # 策略 1: 尝试标准 Excel
-                try:
-                    df = pd.read_excel(io.BytesIO(contents))
-                except:
-                    pass
+                if filename.endswith('.xls') or filename.endswith('.xlsx') or contents.startswith(
+                        b'\xd0\xcf\x11\xe0') or contents.startswith(b'PK\x03\x04'):
+                    try:
+                        df = pd.read_excel(io.BytesIO(contents))
+                    except:
+                        pass
 
-                # 策略 2: 尝试伪装的 HTML (防范某些 frp 本质是 Web Table)
+                # ================= 🚀 核心战法：FastReport 二进制穿透提取术 =================
                 if df is None or df.empty:
-                    for enc in ['gbk', 'gb18030', 'utf-8']:
-                        try:
-                            html_str = contents.decode(enc, errors='ignore')
-                            if '<table' in html_str.lower():
-                                tables = pd.read_html(io.StringIO(html_str))
-                                if tables:
-                                    df = tables[0]
+                    # 强行解码为字符串，忽略所有报错和乱码符号
+                    text = contents.decode('gb18030', errors='ignore')
+
+                    import re
+                    # 提取指定的【财务关键字】和【带有两位小数的金额数值】
+                    tokens = re.findall(r'(零花钱|劳动奖金|会见款|存入汇款|消费|亲情电话|\d+\.\d{2})', text)
+
+                    if not tokens:
+                        raise Exception(
+                            "这是纯粹的二进制文件，且无法从中提取到任何账单关键字或金额。请在老系统中点击『导出』保存为 Excel。")
+
+                    in_inc = 0.0
+                    out_inc = 0.0
+                    shopping = 0.0
+                    phone = 0.0
+
+                    # 遍历提取出来的纯净指令条
+                    for i, token in enumerate(tokens):
+                        if token in ['零花钱', '劳动奖金', '会见款', '存入汇款', '消费', '亲情电话']:
+                            # 往后寻找紧跟在关键字后面的金额数值（最多找3个，覆盖 增、减、余额）
+                            numbers = []
+                            for j in range(i + 1, min(i + 4, len(tokens))):
+                                if re.match(r'^\d+\.\d{2}$', tokens[j]):
+                                    numbers.append(float(tokens[j]))
+                                else:
                                     break
-                        except:
-                            pass
 
-                # 策略 3: 手撕不规则文本（专门对付“流水账信息”、“页码”等脏表头）
-                if df is None or df.empty:
-                    text = None
-                    for enc in ['gbk', 'gb18030', 'utf-8']:
-                        try:
-                            text = contents.decode(enc)
-                            break
-                        except:
-                            pass
+                            if numbers:
+                                # 🌟 核心修复点：精准剥离“余额”列，只取当次“交易额”
+                                # 逻辑：如果第一列(增)是0.0，说明真正的金额在第二列(减)；否则就在第一列。
+                                actual_amount = numbers[1] if len(numbers) >= 2 and numbers[0] == 0.0 else numbers[0]
 
-                    if text:
-                        lines = text.splitlines()
-                        if lines:
-                            # 抽样判断是制表符(\t)还是逗号(,)
-                            sample = "\n".join(lines[:20])
-                            sep = '\t' if sample.count('\t') > sample.count(',') else ','
+                                if token in ['零花钱', '劳动奖金']:
+                                    in_inc += actual_amount
+                                elif token in ['会见款', '存入汇款']:
+                                    out_inc += actual_amount
+                                elif token == '消费':
+                                    shopping += actual_amount
+                                elif token == '亲情电话':
+                                    phone += actual_amount
 
-                            raw_data = [line.split(sep) for line in lines]
-                            if raw_data:
-                                # 🚨 核心抹平术：强行把短的行（如“流水账信息”）补齐到最大列数
-                                max_cols = max(len(row) for row in raw_data)
-                                padded_data = [row + [''] * (max_cols - len(row)) for row in raw_data]
-                                df = pd.DataFrame(padded_data)
-
-                if df is None or df.empty:
-                    raise Exception("无法识别该文件的底层数据结构。")
-
-                # ================= 动态寻址表头 (避开所有脏标题) =================
-                header_idx = -1
-                for i in range(min(50, len(df))):
-                    # 将这一行拼成字符串检查，只有同时包含三大金刚，才是真表头
-                    row_str = "".join([str(x).strip() for x in df.iloc[i].values if pd.notna(x)])
-                    if '项目' in row_str and '增' in row_str and '减' in row_str:
-                        header_idx = i
-                        break
-
-                if header_idx == -1:
-                    raise Exception("解析成功，但未能在这份文件中找到同时包含【项目】、【增】、【减】的真表头行！")
-
-                # 提取并清理列名 (防止空列名导致报错)
-                raw_columns = [str(c).strip() for c in df.iloc[header_idx].values]
-                safe_columns = []
-                for idx, col in enumerate(raw_columns):
-                    safe_columns.append(f"Unnamed_{idx}" if col == "" or col == "nan" else col)
-
-                # 斩断上面所有的脏标题，将这一行设为真表头
-                df.columns = safe_columns
-                df = df.iloc[header_idx + 1:].copy()
-                df = df.loc[:, ~df.columns.duplicated()]
-
-                if '项目' not in df.columns or '增' not in df.columns or '减' not in df.columns:
-                    raise Exception(f"列名挂载失败，提取到的列：{list(df.columns)}")
-
-                # ================= 数值清洗与汇算 =================
-                df['增'] = pd.to_numeric(df['增'], errors='coerce').fillna(0)
-                df['减'] = pd.to_numeric(df['减'], errors='coerce').fillna(0)
-                df['项目'] = df['项目'].astype(str).fillna("")
-
-                in_inc = df[df['项目'].str.contains('零花钱|劳动奖金')]['增'].sum()
-                out_inc = df[df['项目'].str.contains('会见款|存入汇款')]['增'].sum()
-                shopping = df[df['项目'].str.contains('消费')]['减'].sum()
-                phone = df[df['项目'].str.contains('亲情电话')]['减'].sum()
-
-                return {
-                    "in_inc": float(in_inc),
-                    "out_inc": float(out_inc),
-                    "shopping": float(shopping),
-                    "phone": float(phone)
-                }
+                    return {
+                        "in_inc": float(in_inc),
+                        "out_inc": float(out_inc),
+                        "shopping": float(shopping),
+                        "phone": float(phone)
+                    }
 
             except Exception as e:
                 import traceback
                 traceback.print_exc()
-                raise HTTPException(status_code=400, detail=f"旧账单解析失败: {str(e)}")
-
+                if isinstance(e, Exception) and "纯粹的二进制" not in str(e):
+                    raise HTTPException(status_code=400, detail=str(e))
+                raise HTTPException(status_code=400, detail=f"旧账单解析报错: {str(e)}")
         # ==================== 解析【新系统账单】====================
         def parse_new(contents, filename):
             try:
@@ -375,17 +454,36 @@ async def generate_income_expense_doc(
 
         # ==================== Word 原生渲染核心 ====================
         doc = Document()
-        doc.styles['Normal'].font.name = u'宋体'
-        doc.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), u'宋体')
 
-        # 标题居中加大
-        title = doc.add_paragraph('罪犯收入和消费情况统计表')
-        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        title.runs[0].font.size = Pt(16)
-        title.runs[0].font.bold = True
+        # 【1. 大标题排版】黑体，二号，居中，行距最小28磅，段后21磅
+        title_p = doc.add_paragraph()
+        title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        title_p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
+        title_p.paragraph_format.line_spacing = Pt(28)
+        title_p.paragraph_format.space_after = Pt(21)  # 🌟 满足要求：段后21磅
 
-        # 创建并填充模板表格
+        title_run = title_p.add_run('罪犯收入和消费情况统计表')
+        title_run.font.name = '黑体'
+        title_run._element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
+        title_run.font.size = Pt(22)
+
+        # 【2. 表格结构生成】
         table = doc.add_table(rows=9, cols=5, style='Table Grid')
+        table.autofit = False  # 🌟 必须关闭自动拉伸，手动列宽才会严格生效
+
+        # 🌟 满足要求：精确控制每列宽度，整体加宽至约 15.5 厘米，确保文字不换行
+        col_widths = [Cm(2.2), Cm(3.2), Cm(3.5), Cm(3.2), Cm(3.4)]
+        for row in table.rows:
+            for idx, width in enumerate(col_widths):
+                row.cells[idx].width = width
+
+        # 🌟 满足要求：精确控制行高 (最小值规则)
+        for i, row in enumerate(table.rows):
+            row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
+            if i >= 7:
+                row.height = Cm(1.36)  # 最后两行 1.36 厘米
+            else:
+                row.height = Cm(1.17)  # 其他行 1.17 厘米
 
         headers = ['姓名', '罪名', '现刑期起日', '现刑期止日', '入监日期']
         values = [new_data['name'], new_data['crime'], new_data['start'], new_data['end'], new_data['entry']]
@@ -417,47 +515,71 @@ async def generate_income_expense_doc(
         table.cell(6, 2).text = f"{fmt(final_other)}元"
 
         # 单元格跨行合并
-        table.cell(2, 0).merge(table.cell(3, 0))  # 收入框合并
-        table.cell(2, 3).merge(table.cell(3, 3))  # 收入合计框合并
+        table.cell(2, 0).merge(table.cell(3, 0))
+        table.cell(2, 3).merge(table.cell(3, 3))
         table.cell(2, 4).merge(table.cell(3, 4))
-
-        table.cell(4, 0).merge(table.cell(6, 0))  # 消费框合并
-        table.cell(4, 3).merge(table.cell(6, 3))  # 消费合计框合并
+        table.cell(4, 0).merge(table.cell(6, 0))
+        table.cell(4, 3).merge(table.cell(6, 3))
         table.cell(4, 4).merge(table.cell(6, 4))
 
-        # 底部指标结构
+        # 底部两行的合并规则与跨列分配
         table.cell(7, 0).text = '狱内服刑时间'
-        table.cell(7, 1).text = f"{fmt(months)}个月"
-        table.cell(7, 1).merge(table.cell(7, 2))
+        table.cell(7, 3).text = f"{fmt(months)}个月"
+        table.cell(7, 0).merge(table.cell(7, 2))
         table.cell(7, 3).merge(table.cell(7, 4))
 
         table.cell(8, 0).text = '月平均消费'
-        table.cell(8, 1).text = f"{fmt(avg_exp)}元"
-        table.cell(8, 1).merge(table.cell(8, 2))
+        table.cell(8, 3).text = f"{fmt(avg_exp)}元"
+        table.cell(8, 0).merge(table.cell(8, 2))
         table.cell(8, 3).merge(table.cell(8, 4))
 
-        # 批量将表格内字体居中
+        # 【3. 表格内文字排版】仿宋，三号，居中，行距最小值24磅
         for row in table.rows:
             for cell in row.cells:
-                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-                cell.vertical_alignment = 1  # 垂直居中
+                cell.vertical_alignment = 1
+                for p in cell.paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
+                    p.paragraph_format.line_spacing = Pt(24)
 
-        doc.add_paragraph("")  # 增加一条留白
+                    for run in p.runs:
+                        run.font.name = '仿宋'
+                        run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
+                        run.font.size = Pt(16)
 
-        # 落款签字栏
-        p1 = doc.add_paragraph()
-        p1.add_run(f"监区干警签字：{' ' * 20}监狱生活部门干警签字：")
-        p2 = doc.add_paragraph()
-        p2.add_run(f"调取日期：{fetch_date}{' ' * 12}出具日期：{issue_date}")
-        p3 = doc.add_paragraph()
-        p3.add_run(f"{' ' * 35}（部门公章）")
+        # 【4. 表格下方落款排版】仿宋，三号，行距固定值60磅
+        def add_bottom_para(text):
+            p = doc.add_paragraph()
+            # 取消两端对齐，改为左对齐，完全通过全角空格来控制缩进，这样最稳定
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+            p.paragraph_format.line_spacing = Pt(60)
+            run = p.add_run(text)
+            run.font.name = '仿宋'
+            run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
+            run.font.size = Pt(16)
+
+            # 🌟 满足要求：通过“全角空格”(等于一个标准中文字符宽) 完美控制间距与对齐
+
+        gap1 = " " * 8  # 签字间的间隔
+        gap2 = " " * 6  # 日期间的间隔
+
+        add_bottom_para(f"监区干警签字：{gap1}监狱生活部门干警签字：")
+        add_bottom_para(f"调取日期：{fetch_date}{gap2}出具日期：{issue_date}")
+
+        # 🌟 满足要求：动态计算（部门公章）前面的缩进量，使其与“出具日期”的“出”字绝对垂直对齐
+        # “调取日期：”固定 5个字 + 日期的实际字数 + 中间空出的 6个字(gap2)
+        align_spaces = 5 + len(fetch_date) + 6
+        add_bottom_para(f"{' ' * align_spaces}（部门公章）")
+
+        # =========================================================
 
         # 写入内存，通过流式下发给前端
         buffer = io.BytesIO()
         doc.save(buffer)
         buffer.seek(0)
 
-        filename = f"{new_data['name']}消费.docx" if new_data['name'] else "收入消费表.docx"
+        filename = f"{new_data['name']}罪犯收入和消费情况统计表.docx" if new_data['name'] else "罪犯收入和消费情况统计表.docx"
         headers_dict = {'Content-Disposition': f"attachment; filename*=utf-8''{quote(filename)}"}
 
         return StreamingResponse(
