@@ -184,3 +184,292 @@ async def generate_excel(
         print("=" * 50 + "\n")
 
         raise HTTPException(status_code=500, detail=f"消费明细处理失败: {str(e)}")
+
+
+@router.post("/generate_income_expense_doc", summary="生成跨系统收入和消费统计表")
+async def generate_income_expense_doc(
+        old_file: UploadFile = File(...),
+        new_file: UploadFile = File(...),
+        fetch_date: str = Form("  年  月  日"),
+        issue_date: str = Form("  年  月  日")
+):
+    try:
+        old_bytes = await old_file.read()
+        new_bytes = await new_file.read()
+
+        # ==================== 解析【旧系统账单】(终极暴力解码器 V2) ====================
+        def parse_old(contents, filename):
+            try:
+                df = None
+
+                # 策略 1: 尝试标准 Excel
+                try:
+                    df = pd.read_excel(io.BytesIO(contents))
+                except:
+                    pass
+
+                # 策略 2: 尝试伪装的 HTML (防范某些 frp 本质是 Web Table)
+                if df is None or df.empty:
+                    for enc in ['gbk', 'gb18030', 'utf-8']:
+                        try:
+                            html_str = contents.decode(enc, errors='ignore')
+                            if '<table' in html_str.lower():
+                                tables = pd.read_html(io.StringIO(html_str))
+                                if tables:
+                                    df = tables[0]
+                                    break
+                        except:
+                            pass
+
+                # 策略 3: 手撕不规则文本（专门对付“流水账信息”、“页码”等脏表头）
+                if df is None or df.empty:
+                    text = None
+                    for enc in ['gbk', 'gb18030', 'utf-8']:
+                        try:
+                            text = contents.decode(enc)
+                            break
+                        except:
+                            pass
+
+                    if text:
+                        lines = text.splitlines()
+                        if lines:
+                            # 抽样判断是制表符(\t)还是逗号(,)
+                            sample = "\n".join(lines[:20])
+                            sep = '\t' if sample.count('\t') > sample.count(',') else ','
+
+                            raw_data = [line.split(sep) for line in lines]
+                            if raw_data:
+                                # 🚨 核心抹平术：强行把短的行（如“流水账信息”）补齐到最大列数
+                                max_cols = max(len(row) for row in raw_data)
+                                padded_data = [row + [''] * (max_cols - len(row)) for row in raw_data]
+                                df = pd.DataFrame(padded_data)
+
+                if df is None or df.empty:
+                    raise Exception("无法识别该文件的底层数据结构。")
+
+                # ================= 动态寻址表头 (避开所有脏标题) =================
+                header_idx = -1
+                for i in range(min(50, len(df))):
+                    # 将这一行拼成字符串检查，只有同时包含三大金刚，才是真表头
+                    row_str = "".join([str(x).strip() for x in df.iloc[i].values if pd.notna(x)])
+                    if '项目' in row_str and '增' in row_str and '减' in row_str:
+                        header_idx = i
+                        break
+
+                if header_idx == -1:
+                    raise Exception("解析成功，但未能在这份文件中找到同时包含【项目】、【增】、【减】的真表头行！")
+
+                # 提取并清理列名 (防止空列名导致报错)
+                raw_columns = [str(c).strip() for c in df.iloc[header_idx].values]
+                safe_columns = []
+                for idx, col in enumerate(raw_columns):
+                    safe_columns.append(f"Unnamed_{idx}" if col == "" or col == "nan" else col)
+
+                # 斩断上面所有的脏标题，将这一行设为真表头
+                df.columns = safe_columns
+                df = df.iloc[header_idx + 1:].copy()
+                df = df.loc[:, ~df.columns.duplicated()]
+
+                if '项目' not in df.columns or '增' not in df.columns or '减' not in df.columns:
+                    raise Exception(f"列名挂载失败，提取到的列：{list(df.columns)}")
+
+                # ================= 数值清洗与汇算 =================
+                df['增'] = pd.to_numeric(df['增'], errors='coerce').fillna(0)
+                df['减'] = pd.to_numeric(df['减'], errors='coerce').fillna(0)
+                df['项目'] = df['项目'].astype(str).fillna("")
+
+                in_inc = df[df['项目'].str.contains('零花钱|劳动奖金')]['增'].sum()
+                out_inc = df[df['项目'].str.contains('会见款|存入汇款')]['增'].sum()
+                shopping = df[df['项目'].str.contains('消费')]['减'].sum()
+                phone = df[df['项目'].str.contains('亲情电话')]['减'].sum()
+
+                return {
+                    "in_inc": float(in_inc),
+                    "out_inc": float(out_inc),
+                    "shopping": float(shopping),
+                    "phone": float(phone)
+                }
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                raise HTTPException(status_code=400, detail=f"旧账单解析失败: {str(e)}")
+
+        # ==================== 解析【新系统账单】====================
+        def parse_new(contents, filename):
+            try:
+                if filename.endswith('.xls') or filename.endswith('.xlsx'):
+                    df = pd.read_excel(io.BytesIO(contents), header=None)
+                else:
+                    try:
+                        df = pd.read_csv(io.BytesIO(contents), header=None, encoding='utf-8')
+                    except:
+                        df = pd.read_csv(io.BytesIO(contents), header=None, encoding='gbk')
+
+                # 辅助函数：找关键字正下方的格子（提取文本用）
+                def get_below(keyword):
+                    for r in range(df.shape[0]):
+                        for c in range(df.shape[1]):
+                            if str(df.iloc[r, c]).strip() == keyword and r + 1 < df.shape[0]:
+                                return df.iloc[r + 1, c]
+                    return ""
+
+                # 辅助函数：找同行中关键字后面的第一个数字（提取金额/月数用）
+                def get_numeric(keyword):
+                    for r in range(df.shape[0]):
+                        row_vals = [str(x) for x in df.iloc[r].values]
+                        if any(keyword in val for val in row_vals):
+                            for val in row_vals:
+                                try:
+                                    num = float(val)
+                                    if num >= 0: return num
+                                except:
+                                    pass
+                    return 0.0
+
+                # 辅助函数：日期格式化 (应对Excel五位数字日期)
+                def clean_date(d):
+                    if pd.isna(d) or not str(d).strip(): return ""
+                    try:
+                        f = float(d)
+                        if f > 30000: return pd.to_datetime(f, unit='D', origin='1899-12-30').strftime('%Y.%m.%d')
+                    except:
+                        pass
+                    return str(d).replace('-', '.').split(' ')[0]
+
+                return {
+                    "name": get_below('姓名'),
+                    "crime": get_below('罪名'),
+                    "start": clean_date(get_below('现刑期起日')),
+                    "end": clean_date(get_below('现刑期止日')),
+                    "entry": clean_date(get_below('入监日期')),
+                    "in_inc": get_numeric('狱内收入'),
+                    "out_inc": get_numeric('狱外收入'),
+                    "shopping": get_numeric('购物'),
+                    "other": get_numeric('其他支出') or get_numeric('其他'),
+                    "months": get_numeric('狱内服刑时间')
+                }
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"新账单解析失败: {str(e)}")
+
+        old_data = parse_old(old_bytes, old_file.filename)
+        new_data = parse_new(new_bytes, new_file.filename)
+
+        # ==================== 跨系统汇算汇总 ====================
+        final_in_inc = new_data['in_inc'] + old_data['in_inc']
+        final_out_inc = new_data['out_inc'] + old_data['out_inc']
+        total_inc = final_in_inc + final_out_inc
+
+        final_shopping = new_data['shopping'] + old_data['shopping']
+        final_phone = old_data['phone'] + new_data['other']
+        final_other = 0.0
+        total_exp = final_shopping + final_phone + final_other
+
+        months = new_data['months']
+        avg_exp = total_exp / months if months and months > 0 else 0
+
+        # 数值抹零格式化
+        def fmt(n):
+            return f"{n:.2f}".rstrip('0').rstrip('.') if n > 0 else "0"
+
+        # ==================== Word 原生渲染核心 ====================
+        doc = Document()
+        doc.styles['Normal'].font.name = u'宋体'
+        doc.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), u'宋体')
+
+        # 标题居中加大
+        title = doc.add_paragraph('罪犯收入和消费情况统计表')
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        title.runs[0].font.size = Pt(16)
+        title.runs[0].font.bold = True
+
+        # 创建并填充模板表格
+        table = doc.add_table(rows=9, cols=5, style='Table Grid')
+
+        headers = ['姓名', '罪名', '现刑期起日', '现刑期止日', '入监日期']
+        values = [new_data['name'], new_data['crime'], new_data['start'], new_data['end'], new_data['entry']]
+        for i in range(5):
+            table.cell(0, i).text = headers[i]
+            table.cell(1, i).text = str(values[i])
+
+        # 收入部分结构
+        table.cell(2, 0).text = '收入'
+        table.cell(2, 1).text = '狱内收入'
+        table.cell(2, 2).text = f"{fmt(final_in_inc)}元"
+        table.cell(2, 3).text = '收入合计'
+        table.cell(2, 4).text = f"{fmt(total_inc)}元"
+
+        table.cell(3, 1).text = '狱外收入'
+        table.cell(3, 2).text = f"{fmt(final_out_inc)}元"
+
+        # 消费部分结构
+        table.cell(4, 0).text = '消费'
+        table.cell(4, 1).text = '购物'
+        table.cell(4, 2).text = f"{fmt(final_shopping)}元"
+        table.cell(4, 3).text = '消费合计'
+        table.cell(4, 4).text = f"{fmt(total_exp)}元"
+
+        table.cell(5, 1).text = '亲情电话'
+        table.cell(5, 2).text = f"{fmt(final_phone)}元"
+
+        table.cell(6, 1).text = '其他'
+        table.cell(6, 2).text = f"{fmt(final_other)}元"
+
+        # 单元格跨行合并
+        table.cell(2, 0).merge(table.cell(3, 0))  # 收入框合并
+        table.cell(2, 3).merge(table.cell(3, 3))  # 收入合计框合并
+        table.cell(2, 4).merge(table.cell(3, 4))
+
+        table.cell(4, 0).merge(table.cell(6, 0))  # 消费框合并
+        table.cell(4, 3).merge(table.cell(6, 3))  # 消费合计框合并
+        table.cell(4, 4).merge(table.cell(6, 4))
+
+        # 底部指标结构
+        table.cell(7, 0).text = '狱内服刑时间'
+        table.cell(7, 1).text = f"{fmt(months)}个月"
+        table.cell(7, 1).merge(table.cell(7, 2))
+        table.cell(7, 3).merge(table.cell(7, 4))
+
+        table.cell(8, 0).text = '月平均消费'
+        table.cell(8, 1).text = f"{fmt(avg_exp)}元"
+        table.cell(8, 1).merge(table.cell(8, 2))
+        table.cell(8, 3).merge(table.cell(8, 4))
+
+        # 批量将表格内字体居中
+        for row in table.rows:
+            for cell in row.cells:
+                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                cell.vertical_alignment = 1  # 垂直居中
+
+        doc.add_paragraph("")  # 增加一条留白
+
+        # 落款签字栏
+        p1 = doc.add_paragraph()
+        p1.add_run(f"监区干警签字：{' ' * 20}监狱生活部门干警签字：")
+        p2 = doc.add_paragraph()
+        p2.add_run(f"调取日期：{fetch_date}{' ' * 12}出具日期：{issue_date}")
+        p3 = doc.add_paragraph()
+        p3.add_run(f"{' ' * 35}（部门公章）")
+
+        # 写入内存，通过流式下发给前端
+        buffer = io.BytesIO()
+        doc.save(buffer)
+        buffer.seek(0)
+
+        filename = f"{new_data['name']}消费.docx" if new_data['name'] else "收入消费表.docx"
+        headers_dict = {'Content-Disposition': f"attachment; filename*=utf-8''{quote(filename)}"}
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers=headers_dict
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        # 🚨 必须在这里放行内部自定义的友好 HTTP 报错信息，不能让 500 包装把它“吃掉”
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"文书排版失败: {str(e)}")
