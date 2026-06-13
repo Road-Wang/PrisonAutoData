@@ -5,6 +5,10 @@ from fastapi.responses import StreamingResponse
 from openpyxl.styles import Font, Alignment, Border, Side
 from urllib.parse import quote
 import traceback
+from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
 router = APIRouter()
 
 
@@ -12,7 +16,9 @@ router = APIRouter()
 async def generate_excel(
         file: UploadFile = File(...),
         code: str = Form(...),
-        target_name: str = Form("")  # 新增：接收前端传来的罪犯姓名
+        target_name: str = Form(""),
+        fetch_date: str = Form("  年  月  日"),  # 🌟 新增接收调取日期
+        issue_date: str = Form("  年  月  日")   # 🌟 新增接收出具日期
 ):
     try:
         # 直接从内存中读取上传的文件内容
@@ -118,8 +124,9 @@ async def generate_excel(
                         cell.font = Font(name='宋体', size=11)
 
             bottom_font = Font(name='宋体', size=11)
-            date_text_left = "  调取日期：  年  月  日"
-            date_text_right = "出具日期：  年  月  日"
+            # 🌟 核心替换点：将强编码的空白字符替换为动态传进来的参数
+            date_text_left = f"  调取日期：{fetch_date}"
+            date_text_right = f"出具日期：{issue_date}"
             seal_text = "      （部门公章）"
 
             ws.merge_cells('A42:C42')

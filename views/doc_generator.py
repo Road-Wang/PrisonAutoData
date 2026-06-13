@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 from io import BytesIO
+import datetime
 
 # 根据您的 FastAPI 路由配置。假设 expenses 在 api/v1/expenses 路由下注册
 API_URL = "http://127.0.0.1:8888/api/v1/doc_gen"
@@ -14,13 +15,12 @@ def render():
 
     col1, col2, col3 = st.columns([2, 2, 1])
     with col2:
-        # 新增选项
-        doc_type = st.selectbox("📄 文书类别：", ["《提请减刑建议书》", "罪犯个人消费明细表"])
+        # 🌟 1. 新增“罪犯收入和消费情况统计表”选项
+        doc_type = st.selectbox("📄 文书类别：", ["《提请减刑建议书》", "罪犯个人消费明细表", "罪犯收入和消费情况统计表"])
 
     with col1:
         target_name = st.text_input("👤 罪犯姓名：", value=st.session_state.get("current_target_name", ""))
 
-    # 动态匹配：根据输入姓名自动获取编号 (针对消费明细表使用)
     auto_code = ""
     if target_name and doc_type == "罪犯个人消费明细表":
         try:
@@ -126,11 +126,38 @@ def render():
     # =============== 分支 2：罪犯个人消费明细表的逻辑 ===============
     elif doc_type == "罪犯个人消费明细表":
         with col3:
-            # 带入从接口拉取到的自动编号
             code_input = st.text_input("🔢 罪犯编号：", value=auto_code)
 
         st.divider()
         st.subheader("🛒 消费明细表生成台")
+
+        # ================== 🌟 新增：日期联动逻辑 ==================
+
+        # 🌟 计算本月26日的具体日期
+        today = datetime.date.today()
+        default_date = datetime.date(today.year, today.month, 26)
+
+        # 初始化 session_state 中的日期（默认为本月26日）
+        if "expense_date1" not in st.session_state:
+            st.session_state.expense_date1 = default_date
+        if "expense_date2" not in st.session_state:
+            st.session_state.expense_date2 = default_date
+
+        # 定义回调函数：当修改调取日期时，出具日期自动同步
+        def sync_d1_to_d2():
+            st.session_state.expense_date2 = st.session_state.expense_date1
+
+        # 定义回调函数：当修改出具日期时，调取日期自动同步
+        def sync_d2_to_d1():
+            st.session_state.expense_date1 = st.session_state.expense_date2
+
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            st.date_input("📅 调取日期", key="expense_date1", on_change=sync_d1_to_d2)
+        with col_d2:
+            st.date_input("📅 出具日期", key="expense_date2", on_change=sync_d2_to_d1)
+        # =========================================================
+
         st.info("请从监管系统中导出该犯的《个人帐务明细表》(.xls / .xlsx)，系统将自动跨月轧平并排版。")
 
         uploaded_file = st.file_uploader("📂 上传【个人帐务明细表】Excel", type=["xlsx", "xls"])
@@ -140,21 +167,30 @@ def render():
                 st.warning("⚠️ 请先完整填写【姓名】、【编号】并【上传文件】！")
             else:
                 with st.spinner("正在智能清洗消费数据并绘制标准排版表格..."):
-                    # 组装 Multi-Part FormData 数据向后台发送
                     files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
-                    data = {"code": code_input, "target_name": target_name}
+
+                    # 🌟 提取并格式化日期为“XXXX年XX月XX日”
+                    d1_str = f"{st.session_state.expense_date1.year}年{st.session_state.expense_date1.month}月{st.session_state.expense_date1.day}日"
+                    d2_str = f"{st.session_state.expense_date2.year}年{st.session_state.expense_date2.month}月{st.session_state.expense_date2.day}日"
+
+                    # 将日期加入向后端发送的数据包中
+                    data = {
+                        "code": code_input,
+                        "target_name": target_name,
+                        "fetch_date": d1_str,  # 👈 新增
+                        "issue_date": d2_str  # 👈 新增
+                    }
 
                     try:
-                        # 注意：确保 EXPENSE_API_URL 里的路由和你 app.py 挂载的一致
                         res = requests.post(f"{EXPENSE_API_URL}/generate_excel", files=files, data=data)
 
                         if res.status_code == 200:
+                            # ...(后面成功的预览与下载逻辑保持不变)...
                             st.success("✅ 消费明细清洗与排版成功！")
                             excel_bytes = res.content
 
                             st.markdown("### 📊 结构化数据预览")
                             try:
-                                # 因为我们写入 openpyxl 时设置了 startrow=2 (实际上第三行开始是表头)
                                 preview_df = pd.read_excel(BytesIO(excel_bytes), skiprows=2)
                                 st.dataframe(preview_df, use_container_width=True)
                             except Exception as e:
@@ -168,7 +204,72 @@ def render():
                                 type="secondary"
                             )
                         else:
-                            # 🔍 强化报错提取：把 HTTP 状态码打印出来
                             st.error(f"❌ 生成失败 | 状态码: HTTP {res.status_code} | 返回信息: {res.text}")
                     except Exception as e:
                         st.error(f"后台接口调用失败，请检查 API 服务是否启动: {e}")
+
+    # =============== 🌟 分支 3：罪犯收入和消费情况统计表 (全新逻辑) ===============
+    elif doc_type == "罪犯收入和消费情况统计表":
+        st.divider()
+        st.subheader("💰 跨系统收入和消费表生成台")
+
+        # 🌟 锁定默认日期为本月26日
+        today = datetime.date.today()
+        default_date = datetime.date(today.year, today.month, 26)
+
+        if "exp_stat_d1" not in st.session_state:
+            st.session_state.exp_stat_d1 = default_date
+        if "exp_stat_d2" not in st.session_state:
+            st.session_state.exp_stat_d2 = default_date
+
+        def sync_stat_d1_to_d2():
+            st.session_state.exp_stat_d2 = st.session_state.exp_stat_d1
+
+        def sync_stat_d2_to_d1():
+            st.session_state.exp_stat_d1 = st.session_state.exp_stat_d2
+
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            st.date_input("📅 调取日期", key="exp_stat_d1", on_change=sync_stat_d1_to_d2)
+        with col_d2:
+            st.date_input("📅 出具日期", key="exp_stat_d2", on_change=sync_stat_d2_to_d1)
+
+        st.info("请分别上传该犯的【旧系统账务明细表】与【新系统账务汇总表】，系统将自动进行双轨汇算。")
+
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            old_file = st.file_uploader("📂 1. 上传【旧系统】账务明细 (.frp/csv/xls)",
+                                        type=["frp", "csv", "xls", "xlsx"])
+        with col_f2:
+            new_file = st.file_uploader("📂 2. 上传【新系统】账务汇总 (.xls/csv)", type=["csv", "xls", "xlsx"])
+
+        if st.button("🚀 智能汇算并生成 Word 统计表", use_container_width=True, type="primary"):
+            if not old_file or not new_file:
+                st.warning("⚠️ 必须同时上传【旧系统】和【新系统】两份账单文件，才能进行跨月轧平与累计！")
+            else:
+                with st.spinner("正在跨系统融合账单数据并渲染红头文书..."):
+                    files = [
+                        ("old_file", (old_file.name, old_file.getvalue(), old_file.type)),
+                        ("new_file", (new_file.name, new_file.getvalue(), new_file.type))
+                    ]
+
+                    d1_str = f"{st.session_state.exp_stat_d1.year}年{st.session_state.exp_stat_d1.month}月{st.session_state.exp_stat_d1.day}日"
+                    d2_str = f"{st.session_state.exp_stat_d2.year}年{st.session_state.exp_stat_d2.month}月{st.session_state.exp_stat_d2.day}日"
+                    data = {"fetch_date": d1_str, "issue_date": d2_str}
+
+                    try:
+                        res = requests.post(f"{EXPENSE_API_URL}/generate_income_expense_doc", files=files,
+                                            data=data)
+                        if res.status_code == 200:
+                            st.success("✅ 账单跨系统汇算完毕，排版生成成功！")
+                            st.download_button(
+                                label=f"⬇️ 点击下载《{target_name} 收入和消费情况统计表》.docx",
+                                data=res.content,
+                                file_name=f"{target_name}消费.docx" if target_name else "收入和消费情况统计表.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                type="secondary"
+                            )
+                        else:
+                            st.error(f"❌ 生成失败 | HTTP {res.status_code} | {res.text}")
+                    except Exception as e:
+                        st.error(f"调用失败: {e}")
