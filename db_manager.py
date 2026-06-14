@@ -454,6 +454,58 @@ def init_meeting_archive_table():
     conn.commit()
     conn.close()
 
+
+# ==========================================
+# 🌟 新增：局部更新罪犯动态档案 (用于修改或追加特定字段)
+# ==========================================
+def update_criminal_data(criminal_name: str, update_dict: dict) -> bool:
+    """
+    局部更新罪犯的 dynamic_data 字段内容。不会覆盖原有其他数据。
+    例如调用：update_criminal_data("张三", {"财产性判项标准叙述": "全部履行完毕..."})
+    """
+    if not criminal_name or not update_dict:
+        return False
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        # 1. 查找罪犯最新的档案记录
+        cursor.execute("SELECT id, dynamic_data FROM criminals_v5 WHERE criminal_name = ? ORDER BY id DESC LIMIT 1",
+                       (criminal_name,))
+        row = cursor.fetchone()
+
+        if not row:
+            print(f"⚠️ [数据库警告] 未找到【{criminal_name}】的档案，无法更新局部字段！")
+            return False
+
+        db_id = row[0]
+        dynamic_data_str = row[1]
+
+        # 2. 解析现有的 JSON 数据
+        if dynamic_data_str:
+            existing_data = json.loads(dynamic_data_str)
+        else:
+            existing_data = {}
+
+        # 3. 将新的字段（如财产执行情况）融合进原字典
+        existing_data.update(update_dict)
+
+        # 4. 转回 JSON 字符串并写入数据库
+        new_dynamic_data_str = json.dumps(existing_data, ensure_ascii=False)
+        cursor.execute("UPDATE criminals_v5 SET dynamic_data = ? WHERE id = ?", (new_dynamic_data_str, db_id))
+        conn.commit()
+
+        print(f"✅ 成功更新【{criminal_name}】的档案字段: {list(update_dict.keys())}")
+        return True
+
+    except Exception as e:
+        print(f"❌ 局部更新罪犯档案失败: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+
 if __name__ == "__main__":
     init_db()
     init_meeting_tables()

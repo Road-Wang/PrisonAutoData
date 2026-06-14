@@ -3,7 +3,7 @@ import os
 import tempfile
 # 假设你已经将上述引擎保存在 services/review_engine.py
 from services.review_engine import ReviewEngine
-
+from db_manager import get_criminal_dynamic_data, update_criminal_data # 确保引入了你的 db_manager
 
 def render():
 
@@ -12,13 +12,33 @@ def render():
 
     # 1. 顶部查询区域
     with st.container():
+        st.subheader("🔍 基础检索与标准库配置")
         col1, col2 = st.columns([1, 3])
         with col1:
             criminal_name = st.text_input("👤 罪犯姓名", placeholder="输入待审核罪犯姓名...")
         with col2:
-            st.write("")  # 占位对齐
-            st.info("系统会自动从 `Prison_Archives` 目录下检索该犯的起诉书、一审判决等作为比对基准源。")
+            # 动态加载数据库中的标准财产叙述
+            standard_prop_text = ""
+            if criminal_name:
+                db_data = get_criminal_dynamic_data(criminal_name)
+                if db_data:
+                    standard_prop_text = db_data.get("财产性判项标准叙述", "")
 
+            prop_input = st.text_area(
+                "💰 财产性判项执行情况 (标准叙述库)",
+                value=standard_prop_text,
+                height=100,
+                help="此处内容将保存至数据库。本批次减刑生成其他文书时将直接复用此段叙述。大模型也将以此为绝对基准核对评议表。"
+            )
+
+            if st.button("💾 更新该犯财产标准叙述至数据库", type="secondary"):
+                if criminal_name and prop_input:
+                    try:
+                        # 调用 db_manager 的更新方法，将其写入档案字典
+                        update_criminal_data(criminal_name, {"财产性判项标准叙述": prop_input})
+                        st.success("标准叙述已入库！后续文书可直接调取。")
+                    except Exception as e:
+                        st.error(f"入库失败，请检查数据库连接: {e}")
     st.divider()
 
     # 2. 文件上传区域
@@ -74,7 +94,8 @@ def render():
                 status_container.write("👁️ [2/4] 正在启动防断连 OCR 读取审批表与评议表...")
 
                 engine = ReviewEngine(criminal_name=criminal_name)
-                result = engine.run_review(app_paths, eval_paths)
+                # 🌟 注意：我们把 UI 里的标准叙述也传给引擎
+                result = engine.run_review(app_paths, eval_paths, standard_prop_text=prop_input)
 
                 status_container.write("🧠 [3/4] 正在调度 16K 超长上下文大模型进行法理逻辑碰撞...")
                 status_container.write("📝 [4/4] 正在生成红绿灯审查报告...")
