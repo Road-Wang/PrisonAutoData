@@ -10,6 +10,7 @@ from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.enum.table import WD_ROW_HEIGHT_RULE
 from docx.oxml.ns import qn
+from typing import Optional
 router = APIRouter()
 
 
@@ -189,13 +190,13 @@ async def generate_excel(
 
 @router.post("/generate_income_expense_doc", summary="生成跨系统收入和消费统计表")
 async def generate_income_expense_doc(
-        old_file: UploadFile = File(...),
+        old_file: Optional[UploadFile] = File(None),
         new_file: UploadFile = File(...),
         fetch_date: str = Form("  年  月  日"),
         issue_date: str = Form("  年  月  日")
 ):
     try:
-        old_bytes = await old_file.read()
+
         new_bytes = await new_file.read()
 
         # ==================== 解析【旧系统账单】(终极二进制正则粉碎机 V4.1 余额排除版) ====================
@@ -432,8 +433,20 @@ async def generate_income_expense_doc(
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"新账单解析失败: {str(e)}")
 
-        old_data = parse_old(old_bytes, old_file.filename)
         new_data = parse_new(new_bytes, new_file.filename)
+
+        # 如果传了旧文件并且文件名不为空，才去解析
+        if old_file is not None and old_file.filename:
+            old_bytes = await old_file.read()
+            old_data = parse_old(old_bytes, old_file.filename)
+        else:
+            # 如果没传旧文件，直接伪造一个全 0 的旧数据底座参与汇算
+            old_data = {
+                "in_inc": 0.0,
+                "out_inc": 0.0,
+                "shopping": 0.0,
+                "phone": 0.0
+            }
 
         # ==================== 跨系统汇算汇总 ====================
         final_in_inc = new_data['in_inc'] + old_data['in_inc']
@@ -452,15 +465,24 @@ async def generate_income_expense_doc(
         def fmt(n):
             return f"{n:.2f}".rstrip('0').rstrip('.') if n > 0 else "0"
 
-        # ==================== Word 原生渲染核心 ====================
+        # ==================== Word 原生渲染核心 (终极公文排版) ====================
         doc = Document()
 
-        # 【1. 大标题排版】黑体，二号，居中，行距最小28磅，段后21磅
+        # 🌟 修改点 1：页面边距设置 (左边距修改为 2.3 厘米)
+        section = doc.sections[0]
+        section.page_width = Cm(21.0)
+        section.page_height = Cm(29.7)
+        section.top_margin = Cm(2.5)
+        section.bottom_margin = Cm(1.8)
+        section.left_margin = Cm(2.3)  # 👈 这里改成了 2.3
+        section.right_margin = Cm(2.5)
+
+        # 【1. 大标题排版】
         title_p = doc.add_paragraph()
         title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         title_p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
         title_p.paragraph_format.line_spacing = Pt(28)
-        title_p.paragraph_format.space_after = Pt(21)  # 🌟 满足要求：段后21磅
+        title_p.paragraph_format.space_after = Pt(21)
 
         title_run = title_p.add_run('罪犯收入和消费情况统计表')
         title_run.font.name = '黑体'
@@ -469,21 +491,29 @@ async def generate_income_expense_doc(
 
         # 【2. 表格结构生成】
         table = doc.add_table(rows=9, cols=5, style='Table Grid')
-        table.autofit = False  # 🌟 必须关闭自动拉伸，手动列宽才会严格生效
 
-        # 🌟 满足要求：精确控制每列宽度，整体加宽至约 15.5 厘米，确保文字不换行
-        col_widths = [Cm(2.2), Cm(3.2), Cm(3.5), Cm(3.2), Cm(3.4)]
+        # 🌟 双重锁定，彻底关闭任何引擎的自动缩放
+        table.autofit = False
+        table.allow_autofit = False
+
+        # 🌟 修改点 2：将列宽统一全部设置为 3.35 厘米
+        col_widths = [Cm(3.35), Cm(3.35), Cm(3.35), Cm(3.35), Cm(3.35)]
+        # 🌟 终极破局点 1：给底层的“列骨架”打入宽度（专门治服 WPS）
+        for idx, width in enumerate(col_widths):
+            table.columns[idx].width = width
+
+        # 🌟 终极破局点 2：给每个“单元格”内部打入宽度（兼容 Office）
         for row in table.rows:
             for idx, width in enumerate(col_widths):
                 row.cells[idx].width = width
 
-        # 🌟 满足要求：精确控制行高 (最小值规则)
+        # 精确控制行高
         for i, row in enumerate(table.rows):
             row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
             if i >= 7:
-                row.height = Cm(1.36)  # 最后两行 1.36 厘米
+                row.height = Cm(1.36)
             else:
-                row.height = Cm(1.17)  # 其他行 1.17 厘米
+                row.height = Cm(1.17)
 
         headers = ['姓名', '罪名', '现刑期起日', '现刑期止日', '入监日期']
         values = [new_data['name'], new_data['crime'], new_data['start'], new_data['end'], new_data['entry']]
@@ -522,7 +552,7 @@ async def generate_income_expense_doc(
         table.cell(4, 3).merge(table.cell(6, 3))
         table.cell(4, 4).merge(table.cell(6, 4))
 
-        # 底部两行的合并规则与跨列分配
+        # 底部合并规则
         table.cell(7, 0).text = '狱内服刑时间'
         table.cell(7, 3).text = f"{fmt(months)}个月"
         table.cell(7, 0).merge(table.cell(7, 2))
@@ -533,7 +563,7 @@ async def generate_income_expense_doc(
         table.cell(8, 0).merge(table.cell(8, 2))
         table.cell(8, 3).merge(table.cell(8, 4))
 
-        # 【3. 表格内文字排版】仿宋，三号，居中，行距最小值24磅
+        # 【3. 表格内文字排版】
         for row in table.rows:
             for cell in row.cells:
                 cell.vertical_alignment = 1
@@ -547,30 +577,47 @@ async def generate_income_expense_doc(
                         run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
                         run.font.size = Pt(16)
 
-        # 【4. 表格下方落款排版】仿宋，三号，行距固定值60磅
-        def add_bottom_para(text):
-            p = doc.add_paragraph()
-            # 取消两端对齐，改为左对齐，完全通过全角空格来控制缩进，这样最稳定
+        # 【4. 表格下方落款排版 (终极隐形表格对齐法)】
+        # 抛弃算空格的方法，使用透明表格实现右侧签字、日期、公章的三点一线绝对对齐
+
+        sig_table = doc.add_table(rows=3, cols=2)
+        # 默认生成的表格就是无边框的透明表格
+        sig_table.autofit = False
+        sig_table.allow_autofit = False
+
+        # 🌟 精确划分势力范围：总宽度 16.75 厘米（与上方主表格总宽严丝合缝）
+        # 左侧给 8.0 厘米（足够容纳最长的12月日期），右侧给 8.75 厘米
+        sig_widths = [Cm(8.0), Cm(8.75)]
+
+        for idx, width in enumerate(sig_widths):
+            sig_table.columns[idx].width = width
+        for row in sig_table.rows:
+            for idx, width in enumerate(sig_widths):
+                row.cells[idx].width = width
+
+                # 定义填充透明表格单元格的函数
+        def fill_sig_cell(cell, text):
+            p = cell.paragraphs[0]
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.EXACTLY
-            p.paragraph_format.line_spacing = Pt(60)
-            run = p.add_run(text)
-            run.font.name = '仿宋'
-            run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
-            run.font.size = Pt(16)
+            p.paragraph_format.line_spacing = Pt(60)  # 保持60磅固定行距的庄重感
+            if text:
+                run = p.add_run(text)
+                run.font.name = '仿宋'
+                run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
+                run.font.size = Pt(16)
 
-            # 🌟 满足要求：通过“全角空格”(等于一个标准中文字符宽) 完美控制间距与对齐
+        # 第一行：签字区
+        fill_sig_cell(sig_table.cell(0, 0), "监区干警签字：")
+        fill_sig_cell(sig_table.cell(0, 1), "监狱生活部门干警签字：")
 
-        gap1 = " " * 8  # 签字间的间隔
-        gap2 = " " * 6  # 日期间的间隔
+        # 第二行：日期区
+        fill_sig_cell(sig_table.cell(1, 0), f"调取日期：{fetch_date}")
+        fill_sig_cell(sig_table.cell(1, 1), f"出具日期：{issue_date}")
 
-        add_bottom_para(f"监区干警签字：{gap1}监狱生活部门干警签字：")
-        add_bottom_para(f"调取日期：{fetch_date}{gap2}出具日期：{issue_date}")
-
-        # 🌟 满足要求：动态计算（部门公章）前面的缩进量，使其与“出具日期”的“出”字绝对垂直对齐
-        # “调取日期：”固定 5个字 + 日期的实际字数 + 中间空出的 6个字(gap2)
-        align_spaces = 5 + len(fetch_date) + 6
-        add_bottom_para(f"{' ' * align_spaces}（部门公章）")
+        # 第三行：公章区（左侧留空）
+        fill_sig_cell(sig_table.cell(2, 0), "")
+        fill_sig_cell(sig_table.cell(2, 1), "（部门公章）")
 
         # =========================================================
 

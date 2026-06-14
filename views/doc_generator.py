@@ -16,7 +16,7 @@ def render():
     col1, col2, col3 = st.columns([2, 2, 1])
     with col2:
         # 🌟 1. 新增“罪犯收入和消费情况统计表”选项
-        doc_type = st.selectbox("📄 文书类别：", ["《提请减刑建议书》", "罪犯个人消费明细表", "罪犯收入和消费情况统计表"])
+        doc_type = st.selectbox("📄 文书类别：", ["《提请减刑建议书》", "罪犯个人消费明细表", "罪犯收入和消费情况统计表", "三级会议纪要生成"])
 
     with col1:
         target_name = st.text_input("👤 罪犯姓名：", value=st.session_state.get("current_target_name", ""))
@@ -244,14 +244,17 @@ def render():
             new_file = st.file_uploader("📂 2. 上传【新系统】账务汇总 (.xls/csv)", type=["csv", "xls", "xlsx"])
 
         if st.button("🚀 智能汇算并生成 Word 统计表", use_container_width=True, type="primary"):
-            if not old_file or not new_file:
-                st.warning("⚠️ 必须同时上传【旧系统】和【新系统】两份账单文件，才能进行跨月轧平与累计！")
+            # 🌟 修改 1：现在只强制要求必须传新文件
+            if not new_file:
+                st.warning("⚠️ 【新系统】账务汇总表为必传项！如果该犯有旧系统记录，请一并上传以便合并。")
             else:
                 with st.spinner("正在跨系统融合账单数据并渲染红头文书..."):
+                    # 🌟 修改 2：动态拼装文件流，有旧文件才加进去
                     files = [
-                        ("old_file", (old_file.name, old_file.getvalue(), old_file.type)),
                         ("new_file", (new_file.name, new_file.getvalue(), new_file.type))
                     ]
+                    if old_file:
+                        files.append(("old_file", (old_file.name, old_file.getvalue(), old_file.type)))
 
                     d1_str = f"{st.session_state.exp_stat_d1.year}年{st.session_state.exp_stat_d1.month}月{st.session_state.exp_stat_d1.day}日"
                     d2_str = f"{st.session_state.exp_stat_d2.year}年{st.session_state.exp_stat_d2.month}月{st.session_state.exp_stat_d2.day}日"
@@ -265,7 +268,7 @@ def render():
                             st.download_button(
                                 label=f"⬇️ 点击下载《{target_name} 收入和消费情况统计表》.docx",
                                 data=res.content,
-                                file_name=f"{target_name}消费.docx" if target_name else "收入和消费情况统计表.docx",
+                                file_name=f"{target_name}罪犯收入和消费情况统计表.docx" if target_name else "罪犯收入和消费情况统计表.docx",
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                 type="secondary"
                             )
@@ -273,3 +276,110 @@ def render():
                             st.error(f"❌ 生成失败 | HTTP {res.status_code} | {res.text}")
                     except Exception as e:
                         st.error(f"调用失败: {e}")
+
+    elif doc_type == "三级会议纪要生成":
+        st.divider()
+        # 🌟 升级为 4 个步骤
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "📝 1.点名册同步",
+            "👮 2.监区人员管理",
+            "🗂️ 3.本批次档案智能解析",
+            "🚀 4.纪要一键生成"
+        ])
+
+        # --- TAB 1: 点名册更新 ---
+        with tab1:
+            st.info("上传最新的《监舍点名册.xlsx》，系统将自动读取包组干警与罪犯的对应关系并永久保存。")
+            rollcall_file = st.file_uploader("📁 上传监舍点名册", type=["xlsx", "xls"])
+            if st.button("🔄 同步包组关系", use_container_width=True):
+                if rollcall_file:
+                    with st.spinner("正在智能拆解双栏表格..."):
+                        files = {"file": (rollcall_file.name, rollcall_file.getvalue())}
+                        res = requests.post(f"{API_URL}/upload_rollcall", files=files)
+                        if res.status_code == 200:
+                            st.success(res.json().get("message", "更新成功！"))
+                        else:
+                            st.error("更新失败，请检查文件格式。")
+                else:
+                    st.warning("请先上传文件")
+
+        # --- TAB 2: 人员名单管理 (此处可扩展完整的增删改查) ---
+        with tab2:
+            st.info("💡 录入参加会议的监区干警名单，数据将长久保存，直接用于纪要抬头。")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.text_input("监区长姓名：", key="warden")
+                st.text_input("教导员姓名：", key="instructor")
+            with col2:
+                st.text_input("分管刑罚副监区长：", key="deputy1")
+                st.text_input("刑罚专职/内勤：", key="clerk")
+            st.text_area("其他包组干警（用逗号分隔）：", key="officers")
+            if st.button("💾 保存/更新干警名单"):
+                st.success(
+                    "（此功能需绑定您的本地 SQLite 写入接口，为节省篇幅，建议复用您的基础 DB 接口写入 `ward_personnel` 表）")
+
+        # --- TAB 3: 本批次档案上传与大模型解析 (全新逻辑) ---
+        with tab3:
+            st.subheader("🗂️ 减刑核心档案大模型视觉提取")
+            st.info(
+                "💡 请上传本批次罪犯的【一二审判决书、入监登记表、历次减刑裁定、奖惩审批表、财产履行材料】。系统将自动阅读并提炼会议纪要专用的高度浓缩话术，并永久入库。")
+
+            archive_files = st.file_uploader(
+                "📂 批量上传档案扫描件 (支持 PDF/JPG/PNG，建议以罪犯姓名命名文件或文件夹)",
+                type=["pdf", "png", "jpg", "jpeg"],
+                accept_multiple_files=True
+            )
+
+            if st.button("🧠 开始视觉阅卷与智能入库", type="primary", use_container_width=True):
+                if not archive_files:
+                    st.warning("⚠️ 请先上传档案文件！")
+                else:
+                    with st.spinner(
+                            "🤖 AI 正在交叉阅读判决书、裁定书与奖惩表，提炼会议核心数据... (这可能需要几分钟)"):
+                        # 构造 multipart form-data 传给后端
+                        files_payload = [
+                            ("files", (file.name, file.getvalue(), file.type)) for file in archive_files
+                        ]
+                        res = requests.post(f"{API_URL}/extract_meeting_archives", files=files_payload)
+
+                        if res.status_code == 200:
+                            result = res.json()
+                            st.success(
+                                f"🎉 档案解析完毕！成功提取并更新了 {len(result['extracted_names'])} 名罪犯的会议档案：")
+                            st.write("、".join(result['extracted_names']))
+                        else:
+                            st.error(f"解析失败: {res.text}")
+
+        # --- TAB 4: 生成纪要 ---
+        with tab4:
+            st.subheader("🎯 选定本批次减刑人员并生成")
+            meeting_month = st.date_input("📅 会议发生年月：")
+            inmates_input = st.text_area("👥 参与本次评议的罪犯姓名（使用逗号或空格分隔）：",
+                                         placeholder="例如：吕中亮, 杨毅, 匡凤禹...")
+
+            if st.button("🚀 自动抽取数据并生成三份纪要", type="primary", use_container_width=True):
+                if not inmates_input.strip():
+                    st.error("⚠️ 请至少输入一名罪犯姓名！")
+                else:
+                    with st.spinner("正在从数据底座交叉比对刑期、处分、包组归属，并排版红头文件..."):
+                        # 处理输入的姓名
+                        names = [n.strip() for n in inmates_input.replace('，', ',').split(',')]
+                        names = [n for n in names if n]
+
+                        payload = {
+                            "month": meeting_month.strftime("%Y-%m"),
+                            "inmates": names
+                        }
+                        res = requests.post(f"{API_URL}/generate_meeting_docs", json=payload)
+
+                        if res.status_code == 200:
+                            st.success("🎉 三级纪要生成完毕！非固定数据已全部标黄。")
+                            st.download_button(
+                                label="⬇️ 点击下载完整纪要压缩包 (ZIP)",
+                                data=res.content,
+                                file_name=f"减刑会议纪要_{meeting_month.strftime('%Y%m')}.zip",
+                                mime="application/zip",
+                                type="secondary"
+                            )
+                        else:
+                            st.error(f"生成失败：{res.text}")

@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from docxtpl import DocxTemplate
+from typing import List
 import sqlite3
 import json
 import os
@@ -10,6 +11,13 @@ from io import BytesIO
 from datetime import datetime
 from urllib.parse import quote
 
+import io
+import zipfile
+import pandas as pd
+from docx import Document
+from docx.shared import Pt, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
+from docx.oxml.ns import qn
 router = APIRouter()
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -308,4 +316,350 @@ async def get_criminal_info(name: str):
         return {"criminal_number": row[0] if row and row[0] else ""}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询档案编号失败: {str(e)}")
+
+
+# ==========================================
+# 🚀 1. 监舍点名册解析接口 (处理特殊的左右双栏排版)
+# ==========================================
+@router.post("/upload_rollcall")
+async def upload_rollcall(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        # 跳过前两行表头，读取数据
+        df = pd.read_excel(io.BytesIO(contents), skiprows=2)
+
+        mappings = []
+
+        # 提取左半区 (C区) 和 右半区 (D区) 的数据
+        def extract_area(sub_df):
+            current_officer = None
+            current_room = None
+            for _, row in sub_df.iterrows():
+                officer_val = str(row.iloc[0]).strip()
+                room_val = str(row.iloc[1]).strip()
+
+                if officer_val and officer_val != 'nan':
+                    current_officer = officer_val
+                if room_val and room_val != 'nan':
+                    current_room = room_val.replace('\n', '')
+
+                # 遍历后面的成员列
+                for col_idx in range(2, len(row)):
+                    inmate_name = str(row.iloc[col_idx]).strip()
+                    if inmate_name and inmate_name != 'nan' and not inmate_name.isdigit():
+                        if current_officer:
+                            mappings.append((inmate_name, current_officer, current_room))
+
+        # 拆分左右栏 (假设左栏索引0-8，右栏索引10-18)
+        left_df = df.iloc[:, 0:9]
+        right_df = df.iloc[:, 10:19]
+
+        extract_area(left_df)
+        extract_area(right_df)
+
+        # 写入数据库
+        conn = sqlite3.connect("prison_archive.db")
+        c = conn.cursor()
+        c.execute("DELETE FROM inmate_officer_map")  # 清空旧数据
+        c.executemany("""
+                      INSERT INTO inmate_officer_map (inmate_name, officer_name, room_number)
+                      VALUES (?, ?, ?)
+                      """, mappings)
+        conn.commit()
+        conn.close()
+
+        return {"status": "success", "message": f"成功更新 {len(mappings)} 名罪犯的包组归属信息！"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"点名册解析失败: {str(e)}")
+# ==========================================
+# 🚀 2. 三级会议纪要生成核心引擎
+# ==========================================
+def create_meeting_doc(meeting_type, month_str, inmates_list, personnel_dict):
+    doc = Document()
+
+    # 基础样式设置
+    doc.styles['Normal'].font.name = u'仿宋'
+    doc.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), u'仿宋')
+    doc.styles['Normal'].font.size = Pt(16)  # 三号字
+
+    # 动态辅助函数：添加带高亮的段落
+    def add_run(p, text, is_dynamic=False, bold=False):
+        run = p.add_run(text)
+        if bold: run.bold = True
+        if is_dynamic:
+            run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+
+    # 计算日期 (默认25、27、29日)
+    year, month = month_str.split('-')
+    day = "25" if meeting_type == "提名" else ("27" if meeting_type == "评议" else "29")
+    target_reduction_month = f"{year}年{int(month) + 1}月"  # 议题月份推后一月
+
+    # 1. 标题
+    titles = {
+        "提名": "关于罪犯减刑假释案件提名评议记录",
+        "评议": "关于罪犯减刑假释案件集体评议记录",
+        "办公会": "关于罪犯减刑假释案件监区长办公会\n评议记录"
+    }
+    p_title = doc.add_paragraph()
+    p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run_title = p_title.add_run(f"河北省保定监狱十五监区\n{titles[meeting_type]}")
+    run_title.font.name = '黑体'
+    run_title._element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
+    run_title.font.size = Pt(22)
+    run_title.bold = True
+
+    # 2. 会议基本信息
+    doc.add_paragraph(f"时间：{year}年{month}月{day}日")
+    doc.add_paragraph("地点：监区会议室")
+
+    p_host = doc.add_paragraph("主持人：")
+    add_run(p_host, personnel_dict.get("监区长", "未设置"), is_dynamic=True)
+    add_run(p_host, "（监区长）")
+
+    p_attend = doc.add_paragraph("参加人员（姓名、职务）：")
+    attend_str = "、".join([f"{name}({role})" for role, name in personnel_dict.items()])
+    add_run(p_attend, attend_str, is_dynamic=True)
+
+    doc.add_paragraph("列席人员（姓名、职务）：无")
+    doc.add_paragraph("缺席人员（姓名、职务）：无")
+
+    p_recorder = doc.add_paragraph("记录人（姓名、职务）：")
+    add_run(p_recorder, personnel_dict.get("内勤", "未设置"), is_dynamic=True)
+
+    p_topic = doc.add_paragraph("会议议题：")
+    add_run(p_topic, f"{target_reduction_month}有、无期减刑", is_dynamic=True)
+
+    # 3. 按包组干警分组罪犯数据
+    grouped_inmates = {}
+    for inmate in inmates_list:
+        officer = inmate.get("officer_name", "未分配干警")
+        if officer not in grouped_inmates:
+            grouped_inmates[officer] = []
+        grouped_inmates[officer].append(inmate)
+
+    # 前置会议文案 (评议和办公会特有)
+    if meeting_type == "评议":
+        doc.add_paragraph("评议内容（记录评议详情及评议结果）：\n一、刑罚执行专职干警通报本次办案工作开展情况...")
+    elif meeting_type == "办公会":
+        doc.add_paragraph("评议内容（记录评议详情及评议结果）：\n一、刑罚执行专职干警汇报本次办案工作开展情况...")
+
+    # 4. 核心罪犯遍历逻辑
+    counter = 1
+    for officer, inmates in grouped_inmates.items():
+        if meeting_type == "提名":
+            p_officer = doc.add_paragraph()
+            add_run(p_officer, f"包组干警{officer}：", bold=True)
+
+        for idx, inv in enumerate(inmates):
+            p = doc.add_paragraph()
+
+            # 如果是后两个会议，需要在段首加上包组干警汇报的话术
+            if meeting_type != "提名" and idx == 0:
+                add_run(p, f"包组干警{officer}汇报：\n", bold=True)
+
+            # 基本情况拼接
+            add_run(p, f"{counter}、罪犯")
+            add_run(p, inv['name'], is_dynamic=True)
+            add_run(p, f"因犯{inv.get('crime', '')}罪，判处{inv.get('sentence', '')}。")
+            add_run(p, inv.get('entry_date', ''), is_dynamic=True)
+            add_run(p, f"送押监狱服刑改造，服刑期间获得")
+            add_run(p, str(inv.get('prev_reductions', 0)), is_dynamic=True)
+            add_run(p, "次减刑。")
+
+            # 奖励情况
+            add_run(p, "该犯现奖励情况：")
+            add_run(p, inv.get('rewards_str', '无'), is_dynamic=True)
+            add_run(p, "。")
+
+            # 扣分/推迟情况
+            punishments = inv.get('punishments_str', '')
+            if punishments:
+                add_run(p, "该犯")
+                add_run(p, punishments, is_dynamic=True)
+                add_run(p, f"。自")
+                add_run(p, inv.get('eligible_date', ''), is_dynamic=True)
+                add_run(p, "符合呈报减刑条件，已按规定进行推迟。")
+
+            # 财产情况
+            add_run(p, "该犯")
+            add_run(p, inv.get('property_status', '财产性判项已履行完毕'), is_dynamic=True)
+            add_run(p, "。")
+
+            # 减刑建议
+            add_run(p, "监区对该犯建议提请")
+            add_run(p, inv.get('proposed_reduction', '减去有期徒刑X个月'), is_dynamic=True)
+            add_run(p, "。")
+
+            counter += 1
+
+    # 5. 结尾决议
+    doc.add_paragraph("")
+    p_dec = doc.add_paragraph("会议决议：\n    同意")
+    names_str = "、".join([i['name'] for i in inmates_list])
+    add_run(p_dec, names_str, is_dynamic=True)
+    add_run(p_dec, f"等共 ")
+    add_run(p_dec, str(len(inmates_list)), is_dynamic=True)
+    add_run(p_dec, " 名罪犯提请减刑。")
+
+    doc.add_paragraph("\n参加人员签名：\n\n\n\n\n\n")
+    return doc
+
+
+# ==========================================
+# 🚀 接口：大模型会议纪要专用提取引擎 (新增)
+# ==========================================
+@router.post("/extract_meeting_archives")
+async def extract_meeting_archives(files: List[UploadFile] = File(...)):
+    try:
+        # 这里模拟您调用大模型视觉提取服务 (vision_extractor.py 或 dify_client.py)
+        # 💡 在实际生产代码中，您需要将 `files` 送入多模态大模型（如 GPT-4o 或 讯飞/智谱视觉模型）
+
+        # 🌟 核心：给大模型的极度定制化 Prompt 指令如下：
+        """
+        你是一个专业的中国监狱刑罚执行业务 AI 助理。请阅读以下一系列档案扫描件，从中提取会议纪要所需的关键数据，并严格按照以下 JSON 格式返回。
+        如果档案中涉及多名罪犯，请返回一个列表。
+        提取规则：
+        1. "inmate_name": 识别罪犯姓名。
+        2. "crime": 从判决书/执行通知书中提取罪名（如：贩卖毒品罪）。
+        3. "sentence": 提取原判刑期（如：无期徒刑，或有期徒刑十五年）。
+        4. "entry_date": 从执行通知书/入监表提取送押入监日期（格式：XXXX年X月X日）。
+        5. "prev_reductions": 阅读历次减刑裁定，统计已减刑的【次数】（纯数字）。
+        6. "rewards_str": 汇总所有《奖励审批表》，输出高度浓缩的话术，格式必须为："该犯XXXX年X月、XXXX年X月...获得考核表扬X次"。
+        7. "punishments_str": 汇总《惩处表》，格式为："XXXX年X月受到警告X次"（无惩处则留空字符串）。
+        8. "property_status": 综合罚金、没收财产收据或终结执行裁定，用一句话总结（如：被判处没收个人全部财产，被保定市中院裁定终结本次执行程序）。
+        """
+
+        # ----------- 模拟大模型返回解析结果 -----------
+        # 实际代码中，此处 result_json 应为大模型调用的返回结果
+        extracted_data_from_llm = [
+            {
+                "inmate_name": "匡凤禹",
+                "crime": "贩卖毒品罪",
+                "sentence": "无期徒刑",
+                "entry_date": "2015年11月16日",
+                "prev_reductions": 2,
+                "rewards_str": "2023年9月、2024年3月、2024年9月、2025年9月、2026年3月获得考核表扬5次",
+                "punishments_str": "",
+                "eligible_date": "2026年4月7日",  # 可结合大模型或后端逻辑计算
+                "property_status": "被判处没收个人全部财产，被保定市中级人民法院裁定终结本次执行程序",
+                "proposed_reduction": "减去有期徒刑六个月，剥夺政治权利十年不变"  # 可从业务系统算，或大模型抓取本次填报表
+            }
+        ]
+        # ----------------------------------------------
+
+        # 将大模型吐出的规范化 JSON 写入我们刚建好的 meeting_inmate_data 表
+        conn = sqlite3.connect("prison_archive.db")
+        c = conn.cursor()
+
+        saved_names = []
+        for data in extracted_data_from_llm:
+            name = data.get("inmate_name")
+            if not name: continue
+
+            # 使用 REPLACE INTO，如果名字存在则更新，不存在则插入
+            c.execute("""
+                      REPLACE
+                      INTO meeting_inmate_data 
+                (inmate_name, crime, sentence, entry_date, prev_reductions, rewards_str, punishments_str, eligible_date, property_status, proposed_reduction)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      """, (
+                          name, data.get('crime'), data.get('sentence'), data.get('entry_date'),
+                          data.get('prev_reductions', 0), data.get('rewards_str'), data.get('punishments_str'),
+                          data.get('eligible_date'), data.get('property_status'), data.get('proposed_reduction')
+                      ))
+            saved_names.append(name)
+
+        conn.commit()
+        conn.close()
+
+        return {"status": "success", "extracted_names": saved_names}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"智能档案解析失败: {str(e)}")
+
+# ==========================================
+# 🚀 接口升级：让纪要生成器真正读取数据库
+# ==========================================
+# 在您的 generate_meeting_docs 函数内部，修改遍历提取数据的部分：
+@router.post("/generate_meeting_docs")
+async def generate_meeting_docs(payload: dict):
+    target_month = payload.get("month", "2026-06")
+    inmate_names = payload.get("inmates", [])
+
+    if not inmate_names:
+        raise HTTPException(status_code=400, detail="请至少输入一名罪犯姓名")
+
+    conn = sqlite3.connect("prison_archive.db")
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    # 获取人员名单
+    c.execute("SELECT role, name FROM ward_personnel WHERE is_active=1")
+    personnel = {row['role']: row['name'] for row in c.fetchall()}
+
+    # 提取罪犯信息及包组干警信息
+    inmates_data = []
+    for name in inmate_names:
+        name = name.strip()
+        # 1. 查询归属干警
+        c.execute("SELECT officer_name FROM inmate_officer_map WHERE inmate_name=?", (name,))
+        officer_row = c.fetchone()
+        officer = officer_row['officer_name'] if officer_row else "待核实干警"
+
+        # 🌟 3. 核心升级：从我们刚建好的大模型提取表 (meeting_inmate_data) 中抓取真实数据！
+        c.execute("SELECT * FROM meeting_inmate_data WHERE inmate_name=?", (name,))
+        db_row = c.fetchone()
+
+        if db_row:
+            # 数据库里有真实提炼的数据，直接组装
+            inmate_info = {
+                "name": name,
+                "officer_name": officer,
+                "crime": db_row['crime'] or "【罪名缺失】",
+                "sentence": db_row['sentence'] or "【刑期缺失】",
+                "entry_date": db_row['entry_date'] or "【入监日期缺失】",
+                "prev_reductions": db_row['prev_reductions'] or 0,
+                "rewards_str": db_row['rewards_str'] or "无奖励记录",
+                "punishments_str": db_row['punishments_str'] or "",
+                "eligible_date": db_row['eligible_date'] or "【起算日期缺失】",
+                "property_status": db_row['property_status'] or "【财产履行情况缺失】",
+                "proposed_reduction": db_row['proposed_reduction'] or "【拟减幅度缺失】"
+            }
+        else:
+            # 🚨 如果该犯人没有通过 Tab3 上传过档案，提供醒目的标黄占位符
+            inmate_info = {
+                "name": name,
+                "officer_name": officer,
+                "crime": "【未解析档案，请补充】",
+                "sentence": "【未解析档案】",
+                "entry_date": "【XXXX年X月X日】",
+                "prev_reductions": 0,
+                "rewards_str": "【未提取到表扬数据】",
+                "punishments_str": "【未提取到处分数据】",
+                "eligible_date": "【未计算】",
+                "property_status": "【未提取到财产信息】",
+                "proposed_reduction": "【拟减刑幅度未填报】"
+            }
+
+        inmates_data.append(inmate_info)
+    conn.close()
+    # 批量生成三份文档
+    doc1 = create_meeting_doc("提名", target_month, inmates_data, personnel)
+    doc2 = create_meeting_doc("评议", target_month, inmates_data, personnel)
+    doc3 = create_meeting_doc("办公会", target_month, inmates_data, personnel)
+
+    # 打包为 ZIP 内存流下发
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for name, doc in [("包组干警提名会议.docx", doc1), ("集体评议记录.docx", doc2), ("监区长办公会.docx", doc3)]:
+            doc_buffer = io.BytesIO()
+            doc.save(doc_buffer)
+            zip_file.writestr(name, doc_buffer.getvalue())
+
+    zip_buffer.seek(0)
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={'Content-Disposition': 'attachment; filename="三级会议纪要_批量生成.zip"'}
+    )
 

@@ -405,6 +405,55 @@ def process_batch_update(criminal_name: str, batch_type: str, action_date: str, 
     finally:
         conn.close()
 
+# 在 db_manager.py 中添加建表逻辑
+def init_meeting_tables():
+    import sqlite3
+    conn = sqlite3.connect("prison_archive.db")
+    c = conn.cursor()
+    # 1. 监区干警名单表
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS ward_personnel (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT,       -- 角色，如：监区长、教导员、包组干警等
+            name TEXT,       -- 姓名
+            is_active INTEGER DEFAULT 1
+        )
+    ''')
+    # 2. 罪犯与包组干警映射表（由点名册更新）
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS inmate_officer_map (
+            inmate_name TEXT PRIMARY KEY,
+            officer_name TEXT,
+            room_number TEXT,
+            update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+# 在 db_manager.py 中添加
+def init_meeting_archive_table():
+    import sqlite3
+    conn = sqlite3.connect("prison_archive.db")
+    c = conn.cursor()
+    # 创建专门针对会议纪要高度浓缩的档案数据表
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS meeting_inmate_data (
+            inmate_name TEXT PRIMARY KEY,
+            crime TEXT,                  -- 罪名
+            sentence TEXT,               -- 原判刑期
+            entry_date TEXT,             -- 入监日期
+            prev_reductions INTEGER,     -- 历次减刑次数
+            rewards_str TEXT,            -- 表扬详情 (例: 2023年9月...获得考核表扬3次)
+            punishments_str TEXT,        -- 处分详情 (例: 2023年3月受到警告1次)
+            eligible_date TEXT,          -- 符合呈报减刑条件起算日
+            property_status TEXT,        -- 财产性判项履行情况
+            proposed_reduction TEXT,     -- 拟提请减刑幅度
+            update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
 if __name__ == "__main__":
     init_db()
+    init_meeting_tables()
