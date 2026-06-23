@@ -14,9 +14,11 @@ from urllib.parse import quote
 import io
 import zipfile
 import pandas as pd
+from dateutil.relativedelta import relativedelta
 from docx import Document
 from docx.shared import Pt, Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX, WD_LINE_SPACING
+from docx.enum.table import WD_ROW_HEIGHT_RULE
 from docx.oxml.ns import qn
 router = APIRouter()
 

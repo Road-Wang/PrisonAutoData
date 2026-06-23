@@ -95,6 +95,10 @@ class OCRLocator:
 
                         # 使用 curve 曲线连接，画出粗壮的绿笔对勾
                         draw.line([p1, p2, p3], fill="#32CD32", width=5, joint="curve")
+                        # 🌟 核心修复：如果图片有透明通道(RGBA)或调色板模式(P)，强制转为 RGB
+
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
 
             img.save(output_path)
             return output_path

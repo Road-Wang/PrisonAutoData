@@ -1,5 +1,9 @@
-from fastapi import APIRouter, UploadFile, File, Form, Body
+import io
+import pandas as pd
+from fastapi import APIRouter, UploadFile, File, Form, Body, HTTPException
 from fastapi.responses import StreamingResponse
+from datetime import datetime
+import sqlite3
 import json
 import os
 import re
@@ -275,3 +279,47 @@ async def confirm_and_save(
         return {"status": "success", "message": f"🎉 罪犯【{target_name}】的基础档案已永久入库，且卷宗已成功物理归档！"}
     else:
         return {"status": "error", "message": "入库失败，请查看后台日志。"}
+
+
+@router.post("/upload_prison_admin_data", summary="狱政系统数据清洗与同步入库")
+async def upload_prison_admin_data(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+
+        # 跳过前 4 行空行，直接把第 5 行作为表头读取
+        df = pd.read_excel(io.BytesIO(contents), skiprows=4)
+
+        # 定义“脏数据”清洗规则
+        def clean_cell(val):
+            if pd.isna(val):
+                return None
+            val_str = str(val)
+            if val_str.startswith("'"):
+                val_str = val_str[1:]
+            return val_str.strip()
+
+        # 对整张表应用清洗规则
+        df = df.applymap(clean_cell)
+
+        # 清除完全为空的列
+        df = df.dropna(axis=1, how='all')
+
+        update_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        df['系统导入时间'] = update_time
+
+        # 自动建表与全量替换写入（规范化英文表名）
+        conn = sqlite3.connect("prison_archive.db")
+        df.to_sql("prison_admin_data", conn, if_exists='replace', index=False)
+
+        record_count = len(df)
+        conn.close()
+
+        return {
+            "status": "success",
+            "message": f"成功清洗并导入了 {record_count} 名罪犯的狱政系统最新数据！表名：prison_admin_data",
+            "count": record_count,
+            "update_time": update_time
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"狱政数据解析入库失败: {str(e)}")

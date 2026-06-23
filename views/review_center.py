@@ -73,6 +73,7 @@ def render():
         # 临时保存上传的图片供 OCR 读取
         temp_dir = tempfile.mkdtemp()
         app_paths, eval_paths = [], []
+        result = {}  # 🌟 核心修复：提前初始化 result 字典，防止后续崩溃时触发 UnboundLocalError
 
         try:
             for f in approval_files:

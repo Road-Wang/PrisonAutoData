@@ -64,8 +64,13 @@ def render():
         if "模式二" in mode:
             col1, col2 = st.columns(2)
             with col1:
-                doc_category = st.selectbox("📄 指定文书种类：",
-                                            ["一审判决书", "二审裁定书", "起诉书", "结案登记表", "其他"])
+                # 【功能扩充】：加入所有指定的审判、刑罚执行、狱政管理文书
+                doc_options = [
+                    "一审判决", "二审裁定", "二审复核", "一审再审", "二审再审",
+                    "起诉书", "执行通知书", "结案登记表", "入监登记表", "入监体检表",
+                    "年终鉴定表", "奖惩审批表", "分级处遇表", "财产性判项材料", "其他"
+                ]
+                doc_category = st.selectbox("📄 指定文书种类：", doc_options)
             with col2:
                 extra_prompt = st.text_input("🎯 重点提取指令 (选填)：", placeholder="例：重点提取财产没收金额")
 
@@ -298,3 +303,28 @@ def render():
 
     elif not target_name and "模式三" not in mode:
         st.info("👈 请先在上方输入【主犯姓名】，再进行上传操作。")
+
+
+def render_prison_admin_sync():
+    st.subheader("🏛️ 狱政系统核心数据同步舱")
+    st.info(
+        "💡 请直接上传从狱政系统导出的【十五监区罪犯基本情况.xlsx】原表。系统会自动去除前4行空白、清理单引号脏字符，并覆盖更新数据库中的 `prison_admin_data` 表。")
+
+    # 变量名也全部修改为 admin_file
+    admin_file = st.file_uploader("📂 上传最新狱政系统导出表格", type=["xlsx", "xls"], key="prison_admin_file")
+
+    if st.button("🔄 自动清洗并同步至大数据库", type="primary", use_container_width=True):
+        if not admin_file:
+            st.warning("⚠️ 请先上传 Excel 文件！")
+        else:
+            with st.spinner("正在逐行清洗特殊字符，并执行全量数据覆写..."):
+                files = {"file": (admin_file.name, admin_file.getvalue(), admin_file.type)}
+                # 路由调用同步修改为英文路由
+                res = requests.post("http://127.0.0.1:8888/api/upload_prison_admin_data", files=files)
+
+                if res.status_code == 200:
+                    data = res.json()
+                    st.success(f"🎉 {data['message']}")
+                    st.toast(f"最后同步时间: {data['update_time']}")
+                else:
+                    st.error(f"同步失败: {res.text}")

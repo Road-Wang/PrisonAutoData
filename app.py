@@ -33,6 +33,7 @@ if st.session_state.current_target_name:
 # 3. 动态路由分发逻辑
 if main_block == "1️⃣ 罪犯档案扫描及智能入库":
     archive_dashboard.render()
+    archive_dashboard.render_prison_admin_sync()
 
 elif main_block == "2️⃣ 减刑/假释/暂外资格筛查":
     screening_hub.render()
