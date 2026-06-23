@@ -248,3 +248,73 @@ def process_batch_documents(image_paths: list, target_name: str):
         data = extract_single_document(path, doc_name, target_name)
         all_extracted_data.append({"source_file": doc_name, "extracted_content": data})
     return all_extracted_data
+
+
+def stream_extract_from_full_text(combined_text: str, target_name: str, doc_category: str, extra_prompt: str):
+    """
+    🌟 专为模式二设计的：全文通读+双驱溯源提取流
+    同时输出标准结构化数据与物理证据链，彻底封杀幻觉。
+    """
+    safe_target = target_name.strip() if target_name else "通用"
+    prompt = f"""
+    你是一个拥有超大上下文窗口且极其严谨的司法档案审计AI。
+    【核心任务】
+    请通读下方包含物理页码标记的【{doc_category}】全卷文本，精准提取罪犯【{safe_target}】的法理数据（必须忽略同案犯）。
+
+    ⚠️【极端重要指令：开启双驱溯源，拒绝幻觉】
+    你必须为你提取的每一个非空字段寻找铁证！你必须输出两部分内容：
+    1. "confirmed_data": 用于永久入库的标准纯净键值对。
+    2. "evidence_chain": 对应的证据溯源链。键名必须与 confirmed_data 完全一致，其值必须严格格式化为：“第X页原文：'包含该信息的完整句子'”。
+
+    如果在全卷文本中没有任何一页提到该字段的内容（例如你没有看到任何关于“别化名”或“前科劣迹”的记录），该字段在 confirmed_data 中必须填空字符串 ""，在 evidence_chain 中填 "全卷未提及"。
+    绝允许凭空编造、凭经验猜测或将同案犯的信息张冠李戴！
+
+    【用户特别指令】：{extra_prompt if extra_prompt else "无"}
+
+    必须严格输出合法的 JSON 格式，绝不要包含 Markdown 标识符(如```json)或多余文字：
+    {{
+        "confirmed_data": {{
+            "文书类别": "{doc_category}", "作出机关": "...", "案号": "...", "姓名": "...", "别化名": "...", "性别": "...", "出生日期": "...",
+            "籍贯": "...", "捕前住址": "...", "起诉机关": "...", "起诉案号": "...", "起诉时间": "...", "拘留日期": "...", "逮捕日期": "...", "逮捕机关": "...",
+            "前科及劣迹": "...", "主犯": "...", "累犯": "...", "涉黑恶职务金融": "...", "一审判决机关": "...", "一审判决案号": "...", "罪名": "...", "一审刑期": "...",
+            "原判或现刑期起日": "...", "原判或现刑期止日": "...", "附加刑": "...", "财产性判项": "...", "犯罪事实": "...", "一审判决时间": "...",
+            "二审判决机关": "...", "二审判决案号": "...", "二审判决时间": "...", "二审判决罪名": "...", "入监日期": "...", "奖惩情况": "...",
+            "本文件记载的减刑历史": "...", "其他信息": "...", "本文件记载的日常奖惩": "..."
+        }},
+        "evidence_chain": {{
+            "作出机关": "第X页原文：'...' ",
+            "案号": "第X页原文：'...' ",
+            "姓名": "第X页原文：'...' ",
+            "别化名": "第X页原文：'...' ",
+            "一审刑期": "第X页原文：'...' "
+            // ... 这里的键必须与上方 confirmed_data 每一个键保持1:1完全对应映射 ...
+        }}
+    }}
+
+    【多页全卷原始文本 (已包含页面物理标记)】
+    {combined_text}
+    """
+
+    payload = {
+        "model": "qwen3.6:27b",
+        "prompt": prompt,
+        "stream": True,
+        "keep_alive": 0,
+        "options": {
+            "temperature": 0.0,  # 🌟 强制将创造力降为0，极致追求确定性，防止胡言乱语
+            "top_p": 0.1,
+            "num_ctx": 32768
+        }
+    }
+
+    try:
+        response = requests.post(OLLAMA_VISION_URL, json=payload, stream=True, timeout=300)
+        if response.status_code == 200:
+            for line in response.iter_lines():
+                if line:
+                    chunk = json.loads(line.decode('utf-8'))
+                    yield chunk.get("response", "")
+        else:
+            yield f'{{"error": "后端接口异常, 状态码: {response.status_code}"}}'
+    except Exception as e:
+        yield f'{{"error": "流式提取异常: {str(e)}"}}'

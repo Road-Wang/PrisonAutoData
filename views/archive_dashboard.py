@@ -300,6 +300,36 @@ def render():
                             st.markdown("**🔍 冲突详情：**")
                             st.markdown(conflict_detail)
                             st.info(f"**💡 AI 研判结论：**\n\n{suggestion}")
+                # ==========================================
+                # 🔍 新增：关键数据物理溯源可视化看板
+                # ==========================================
+                st.divider()
+                st.subheader("🔍 关键数据物理溯源链（对账看板）")
+
+                evidence_chain = report_data.get("evidence_chain", {})
+                confirmed_fields = report_data.get("confirmed_data", {})
+
+                if evidence_chain:
+                    st.info(
+                        "💡 提示：下方展示了左侧表格中数据的原始出处。如果怀疑 AI 产生幻觉，请在此核查具体页码与原文。")
+
+                    # 遍历左侧展示的所有核心键，提供可视化卡片对照
+                    for field_key, field_value in confirmed_fields.items():
+                        # 过滤掉内容过长或不需要高频对账的超大文本块（如复杂的犯罪事实）
+                        if field_key in ["犯罪事实", "其他信息"] or not field_value:
+                            continue
+
+                        source_info = evidence_chain.get(field_key, "系统未生成该字段的溯源链")
+
+                        # 使用带颜色的容器组件清晰呈现
+                        with st.expander(f"📋 【{field_key}】 ➔ `{field_value}`", expanded=False):
+                            st.markdown(f"**📊 当前提取值：** `{field_value}`")
+                            if "全卷未提及" in source_info:
+                                st.warning(f"**📍 溯源证据：** {source_info}")
+                            else:
+                                st.success(f"**📍 溯源证据：** {source_info}")
+                else:
+                    st.info("本次分析未生成追溯映射链，可能由于处理模式不匹配或旧版缓存导致。")
 
     elif not target_name and "模式三" not in mode:
         st.info("👈 请先在上方输入【主犯姓名】，再进行上传操作。")
