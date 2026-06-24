@@ -164,11 +164,12 @@ async def upload_archive_batch(
 
                 # 追加历史底层数据作为前置知识 (防冲突)
                 historical_data = get_criminal_dynamic_data(target_name)
-                if historical_data:
-                    yield json.dumps(
-                        {"step": "logic", "msg": f"📂 侦测到【{target_name}】的历史系统存档！已加入全卷上下文..."}) + "\n"
-                    full_text_blocks.append(
-                        f"\n\n=====================\n【底座历史档案参考】\n=====================\n{json.dumps(historical_data, ensure_ascii=False)}")
+                # ❌ 删除下面这段代码，不把历史数据喂给大模型！
+                # if historical_data:
+                #     yield json.dumps(
+                #         {"step": "logic", "msg": f"📂 侦测到【{target_name}】的历史系统存档！已加入全卷上下文..."}) + "\n"
+                #     full_text_blocks.append(
+                #         f"\n\n=====================\n【底座历史档案参考】\n=====================\n{json.dumps(historical_data, ensure_ascii=False)}")
 
                 # ==========================================
                 # 🧠 资源调度：三段式汉堡架构 (防 OOM 与 注意力涣散)
@@ -208,14 +209,21 @@ async def upload_archive_batch(
 
                 # 第二阶段：一气呵成流式提取法理
                 full_final_text = ""
+                last_reported_len = 0  # 🌟 新增：追踪上一次播报的长度阈值
                 final_generator = stream_extract_from_full_text(combined_text, target_name, doc_category, extra_prompt)
 
                 for text_fragment in final_generator:
+                    # 物理过滤掉任何漏网的空字符
+                    if not text_fragment:
+                        continue
+
                     full_final_text += text_fragment
                     print(text_fragment, end="", flush=True)
                     yield json.dumps({"step": "logic_stream", "chunk": text_fragment}) + "\n"
 
-                    if len(full_final_text) % 100 == 0:
+                    # 🌟 修复“0字死循环”与跳帧Bug：只有文字实打实增加了 150 个字，才通知前端刷新一次
+                    if len(full_final_text) - last_reported_len >= 150:
+                        last_reported_len = len(full_final_text)
                         yield json.dumps(
                             {"step": "logic", "msg": f"🧠 上帝视角通读推演中... ({len(full_final_text)} 字)"}) + "\n"
 
@@ -223,19 +231,83 @@ async def upload_archive_batch(
                 if not clean_str_match:
                     raise Exception("大模型未能输出合法的 JSON 闭合结构！")
 
-                # 🌟 解析出包含 confirmed_data 和 evidence_chain 的复合结构
+                # 🌟 1. 拆包大模型纯净提取的新文书数据
                 raw_report = json.loads(clean_str_match.group(0))
+                new_data = raw_report.get("confirmed_data", {})
+                new_evidence = raw_report.get("evidence_chain", {})
 
-                # 重新按 Streamlit 视图规范组装
+                yield json.dumps({"step": "logic", "msg": "🔍 正在与系统底层历史档案进行交叉比对与增量融合..."}) + "\n"
+
+                # 🌟 2. 调取真实的底座历史数据
+                historical_data = get_criminal_dynamic_data(target_name) or {}
+
+                merged_confirmed = {}
+                merged_evidence = {}
+                conflicts = []
+
+                # 将新数据和旧数据的所有字段名汇总
+                all_keys = set(new_data.keys()).union(set(historical_data.keys()))
+
+                # 判空小工具：屏蔽各种奇葩的空值表述
+                def is_empty(val):
+                    if not val: return True
+                    v = str(val).strip()
+                    return v in ["", "无", "未提及", "全卷未提及", "未提取到", "None"]
+
+                # 🌟 3. 逐条执行法理比对判决
+                for k in all_keys:
+                    old_v = str(historical_data.get(k, "")).strip()
+                    new_v = str(new_data.get(k, "")).strip()
+                    new_ev = new_evidence.get(k, "全卷未提及")
+
+                    # 场景 A：都没数据
+                    if is_empty(old_v) and is_empty(new_v):
+                        merged_confirmed[k] = ""
+                        merged_evidence[k] = "无记录"
+
+                    # 场景 B：历史有数据，但本次文书没提到 ➔ 【无损保留历史】
+                    elif not is_empty(old_v) and is_empty(new_v):
+                        merged_confirmed[k] = old_v
+                        merged_evidence[k] = "📚 [历史底座档案保持] (本次上传的文书中未提及此项，已自动继承历史数据)"
+
+                        # 场景 C：历史为空，本次新提取到了 ➔ 【增量补全】
+                    elif is_empty(old_v) and not is_empty(new_v):
+                        merged_confirmed[k] = new_v
+                        merged_evidence[k] = f"🆕 [新发现信息]\n📍 溯源：{new_ev}"
+
+                        # 场景 D：双方都有数据 ➔ 必须一较高下
+                    else:
+                        # 判定 1：高度一致或包含 (如: "男" 和 "男", 或 "寻衅滋事" 和 "寻衅滋事罪")
+                        if old_v == new_v or old_v in new_v or new_v in old_v:
+                            # 选取字数更全的那一个保留
+                            merged_confirmed[k] = new_v if len(new_v) > len(old_v) else old_v
+                            # 增加高信誉标记！
+                            merged_evidence[
+                                k] = f"✅ [多源交叉印证，置信度极高！]\n历史底座已存在此信息，本次文书再次确认无误。\n📍 最新证据：{new_ev}"
+
+                        # 判定 2：发生实质性矛盾
+                        else:
+                            # 保守策略：左侧展示框默认保留旧数据，不自动篡改
+                            merged_confirmed[k] = old_v
+                            merged_evidence[k] = f"⚠️ [与历史数据发生冲突]\n📍 本次新文书提取依据：{new_ev}"
+
+                            # 将冲突推入右侧警报看板
+                            conflicts.append({
+                                "字段": k,
+                                "矛盾数据": f"**【系统历史底座档案】**：`{old_v}`\n\n**【本次《{doc_category}》提取】**：`{new_v}`",
+                                "研判意见": f"系统侦测到重大数据冲突。请干警查阅右侧原文溯源，并在左侧表格中**手动修改/确认**最终的正确结果。"
+                            })
+
+                # 🌟 4. 重新组装并下发给前端
                 formatted_report = {
-                    "confirmed_data": raw_report.get("confirmed_data", {}),
-                    "evidence_chain": raw_report.get("evidence_chain", {}),  # 🌟 安全注入溯源链
-                    "conflicts": raw_report.get("conflicts", []),
+                    "confirmed_data": merged_confirmed,
+                    "evidence_chain": merged_evidence,
+                    "conflicts": conflicts,
                     "archive_mapping": archive_mapping
                 }
 
                 yield json.dumps(
-                    {"step": "done", "msg": "🎉 判决书全卷通读研判彻底完成！", "data": formatted_report}) + "\n"
+                    {"step": "done", "msg": "🎉 增量更新与交叉印证完成！", "data": formatted_report}) + "\n"
                 return
 
             # ==========================================

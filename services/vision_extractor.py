@@ -313,7 +313,18 @@ def stream_extract_from_full_text(combined_text: str, target_name: str, doc_cate
             for line in response.iter_lines():
                 if line:
                     chunk = json.loads(line.decode('utf-8'))
-                    yield chunk.get("response", "")
+
+                    # 🚨 核心防线 1：拦截大模型底层的致命报错 (如 RTX 5090 显存溢出 OOM、上下文超限)
+                    if "error" in chunk:
+                        yield f'{{"error": "Ollama引擎底层报错: {chunk["error"]}"}}'
+                        break
+
+                    token = chunk.get("response", "")
+
+                    # 🚨 核心防线 2：直接丢弃 Ollama 在思考阶段发出的空字符，掐断风暴源头
+                    if token:
+                        yield token
+
         else:
             yield f'{{"error": "后端接口异常, 状态码: {response.status_code}"}}'
     except Exception as e:

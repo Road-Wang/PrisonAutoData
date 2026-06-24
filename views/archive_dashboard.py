@@ -119,9 +119,12 @@ def render():
                         files_payload.append(("files", (file.name, file.getvalue(), file.type)))
 
                     # 🌟 核心：将动态参数全部打包装进 payload
+                    # 【修复切片Bug】：通过关键字安全提取，丢弃 emoji 和尾部描述
+                    safe_mode_name = "模式一" if "模式一" in mode else "模式二" if "模式二" in mode else "模式三"
+
                     data_payload = {
                         "target_name": target_name,
-                        "mode": mode[:3],  # 截取 "模式一", "模式二", "模式三"
+                        "mode": safe_mode_name, # 截取 "模式一", "模式二", "模式三"
                         "doc_category": doc_category,
                         "extra_prompt": extra_prompt,
                         "batch_name": batch_name,
@@ -182,7 +185,7 @@ def render():
                                     if "data" in chunk:
                                         logic_box.markdown(logic_log)
                                         st.session_state.final_report_data = chunk["data"]
-                                        st.session_state.mode_status = mode[:3]  # 记录本次成功的模式
+                                        st.session_state.mode_status = "模式一" if "模式一" in mode else "模式二" if "模式二" in mode else "模式三"
                                         total_time = int(time.time() - start_time)
                                         progress_bar.progress(100, text="✅ 研判彻底完成！")
                                         status.update(label=f"✅ 联合办案完成！总耗时: {total_time} 秒", state="complete",
