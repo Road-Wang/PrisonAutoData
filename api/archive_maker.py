@@ -12,7 +12,7 @@ import shutil
 from typing import List
 
 # 🌟 新增导入了 process_batch_update
-from services.vision_extractor import process_batch_documents, extract_single_document, stream_extract_from_full_text
+from services.vision_extractor import process_batch_documents, extract_single_document, stream_extract_from_full_text, encode_image_to_base64
 from services.conflict_resolver import stream_synthesize_and_detect_conflicts
 from db_manager import save_criminal_to_db, process_batch_update
 
@@ -207,10 +207,26 @@ async def upload_archive_batch(
                 yield json.dumps({"step": "logic",
                                   "msg": f"🧠 全卷文本无缝合并完成 (共 {len(combined_text)} 字)！正在激活上帝视角..."}) + "\n"
 
+                # ==========================================
+                # 👁️ 红章透视协议：独立提取卷宗尾页的图像数据
+                # ==========================================
+                last_page_path = saved_paths[-1] if saved_paths else None
+                last_page_b64 = None
+                if last_page_path:
+                    try:
+                        last_page_b64 = encode_image_to_base64(last_page_path)
+                        yield json.dumps({"step": "logic",
+                                          "msg": "👁️ 启动【红章透视】协议：已提取尾页原图并挂载至多模态神经..."}) + "\n"
+                    except Exception as e:
+                        print(f"尾页图片转码失败: {e}")
+
                 # 第二阶段：一气呵成流式提取法理
                 full_final_text = ""
                 last_reported_len = 0  # 🌟 新增：追踪上一次播报的长度阈值
-                final_generator = stream_extract_from_full_text(combined_text, target_name, doc_category, extra_prompt)
+                # 🌟 注意这里传入了 last_page_b64
+                final_generator = stream_extract_from_full_text(
+                    combined_text, target_name, doc_category, extra_prompt, last_page_b64=last_page_b64
+                )
 
                 for text_fragment in final_generator:
                     # 物理过滤掉任何漏网的空字符
@@ -229,7 +245,9 @@ async def upload_archive_batch(
 
                 clean_str_match = re.search(r'\{.*\}', full_final_text, re.DOTALL)
                 if not clean_str_match:
-                    raise Exception("大模型未能输出合法的 JSON 闭合结构！")
+                    # 🚨 核心排雷：将未加工的原始输出暴露出来，不再是盲盒！
+                    error_detail = full_final_text if full_final_text.strip() else "【空字符串】(Ollama底层崩溃或模型未输出任何内容)"
+                    raise Exception(f"大模型未能输出合法的 JSON 闭合结构！\n🔍 它的实际输出内容为：\n{error_detail[:500]}")
 
                 # 🌟 1. 拆包大模型纯净提取的新文书数据
                 raw_report = json.loads(clean_str_match.group(0))

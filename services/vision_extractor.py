@@ -11,6 +11,25 @@ import traceback
 OLLAMA_VISION_URL = "http://127.0.0.1:11434/api/generate"
 
 
+# ==========================================
+# 📚 全局动态文书骨架注册表 (Schema Registry)
+# ==========================================
+DOCUMENT_FIELD_REGISTRY = {
+    "判决书": ["判决机关", "案号", "姓名", "别化名", "性别", "出生日期", "文化程度",  "籍贯", "捕前住址", "起诉机关", "起诉时间", "拘留日期", "逮捕日期", "拘留机关", "逮捕机关", "前科及劣迹", "主犯", "累犯", "涉黑恶职务金融", "罪名", "刑期", "刑期起日", "刑期止日", "附加刑", "财产性判项", "犯罪事实", "判决日期"],
+    "减刑裁定书": ["裁定机关", "案号", "姓名", "别化名", "原判信息", "本次减刑所获得奖惩", "前科及劣迹", "财产性判项执行履行情况", "原判刑期", "现刑期起日", "现刑期止日", "减刑或假释幅度", "新刑期", "新刑期起日", "新刑期止日",  "裁定日期"],
+    "执行通知书": ["执行机关", "案号", "姓名", "原判刑期起日", "原判刑期止日", "执行日期"],
+    "结案登记表": ["结案日期", "姓名", "曾用名", "性别", "年龄", "民族", "出身", "成份", "文化程度", "特长", "籍贯", "捕前住址", "捕前职业、政治面目", "逮捕机关", "案件类别", "刑期", "过去违法、犯罪及处理情况", "是否剥夺政治权利",  "简历", "犯罪事实", "实际执行刑期", "释放类型"],
+    "入监登记表": ["单位", "入监日期", "姓名", "别化名", "民族", "出生日期", "文化程度", "捕前职业", "原政治面貌", "特长", "身份证号", "籍贯", "原户籍所在地", "家庭住址", "婚姻状况", "拘留日期", "逮捕机关" , "逮捕日期", "判决书号", "判决机关", "判决日期", "罪名", "刑种",  "刑期", "刑期起止", "附加刑", "曾受何种惩处", "身体状况", "本人简历", "主要犯罪事实", "家庭成员及主要社会关系", "同案犯"],
+    "入监体检表": ["姓名", "基础信息", "体检日期", "身高", "体重", "体貌特征", "既往病史", "检查项目", "主检医师意见"],
+    "奖惩审批表": ["姓名", "奖惩日期", "奖惩类别", "奖惩事由"],
+    "年终鉴定表": ["姓名", "鉴定年度", "基本信息",  "主要犯罪事实", "本年度奖罚情况", "个人鉴定", "包组干警意见", "鉴定落款时间"],
+    "分级处遇": ["姓名", "审批日期", "原处遇等级", "新处遇等级", "调整原因"],
+    "财产性判项材料": ["姓名", "出具机关", "执行案号", "财产性判项执行情况描述", "落款日期"],
+    "起诉书": ["起诉机关", "起诉案号", "姓名", "指控犯罪事实", "指控罪名", "起诉日期"],
+    # 🎯 默认兜底：如果干警选择了字典外的新文书，默认提取这几项基础信息防崩溃
+    "通用默认兜底": ["姓名", "文书时间", "核心业务内容", "作出机关", "备注"]
+}
+
 def encode_image_to_base64(image_path: str, max_size=1600):
     try:
         with Image.open(image_path) as img:
@@ -250,46 +269,54 @@ def process_batch_documents(image_paths: list, target_name: str):
     return all_extracted_data
 
 
-def stream_extract_from_full_text(combined_text: str, target_name: str, doc_category: str, extra_prompt: str):
+def stream_extract_from_full_text(combined_text: str, target_name: str, doc_category: str, extra_prompt: str, last_page_b64: str = None):
     """
-    🌟 专为模式二设计的：全文通读+双驱溯源提取流
-    同时输出标准结构化数据与物理证据链，彻底封杀幻觉。
+    🌟 专为模式二设计的：全文通读 + 双驱溯源 + 红章透视提取流
     """
     safe_target = target_name.strip() if target_name else "通用"
+
+    # ==========================================
+    # 🌟 核心升级：智能感知并拼装 JSON 骨架
+    # ==========================================
+    # 1. 自动匹配注册表中的文书类型
+    matched_fields = DOCUMENT_FIELD_REGISTRY.get("通用默认兜底")
+    for key, fields in DOCUMENT_FIELD_REGISTRY.items():
+        if key in doc_category:
+            matched_fields = fields
+            break
+
+    # 2. 自动生成 confirmed_data 和 evidence_chain 模板
+    confirmed_data_template = {"文书类别": doc_category}
+    evidence_chain_template = {}
+
+    for field in matched_fields:
+        confirmed_data_template[field] = "..."
+        # 针对落款日期的智能挂载视觉指令
+        if "时间" in field or "日期" in field:
+            evidence_chain_template[field] = "尾页图片视觉透视：'...' (如果文本中找不到，请看原图)"
+        else:
+            evidence_chain_template[field] = "第X页原文：'...'"
+
+    # 3. 转化为大模型认识的字符串模板
+    dynamic_schema = json.dumps({
+        "confirmed_data": confirmed_data_template,
+        "evidence_chain": evidence_chain_template
+    }, ensure_ascii=False, indent=4)
+
     prompt = f"""
     你是一个拥有超大上下文窗口且极其严谨的司法档案审计AI。
     【核心任务】
     请通读下方包含物理页码标记的【{doc_category}】全卷文本，精准提取罪犯【{safe_target}】的法理数据（必须忽略同案犯）。
 
-    ⚠️【极端重要指令：开启双驱溯源，拒绝幻觉】
-    你必须为你提取的每一个非空字段寻找铁证！你必须输出两部分内容：
-    1. "confirmed_data": 用于永久入库的标准纯净键值对。
-    2. "evidence_chain": 对应的证据溯源链。键名必须与 confirmed_data 完全一致，其值必须严格格式化为：“第X页原文：'包含该信息的完整句子'”。
-
-    如果在全卷文本中没有任何一页提到该字段的内容（例如你没有看到任何关于“别化名”或“前科劣迹”的记录），该字段在 confirmed_data 中必须填空字符串 ""，在 evidence_chain 中填 "全卷未提及"。
-    绝允许凭空编造、凭经验猜测或将同案犯的信息张冠李戴！
+    ⚠️【防崩溃核心指令】
+    1. 短文书容错：如果 JSON 模板中的某些字段在原文中完全找不到，请直接填入 ""（空字符串），并在 evidence_chain 中填 "全卷未提及"。**绝对不允许因为找不到字段而中断输出或输出空字符！**
+    2. 双驱溯源：必须在 evidence_chain 中提供原话出处。
+    3. 红章透视：如果文本中找不到落款时间，务必启动视觉神经审视附带的图片，看穿公章提取年月日。
 
     【用户特别指令】：{extra_prompt if extra_prompt else "无"}
 
-    必须严格输出合法的 JSON 格式，绝不要包含 Markdown 标识符(如```json)或多余文字：
-    {{
-        "confirmed_data": {{
-            "文书类别": "{doc_category}", "作出机关": "...", "案号": "...", "姓名": "...", "别化名": "...", "性别": "...", "出生日期": "...",
-            "籍贯": "...", "捕前住址": "...", "起诉机关": "...", "起诉案号": "...", "起诉时间": "...", "拘留日期": "...", "逮捕日期": "...", "逮捕机关": "...",
-            "前科及劣迹": "...", "主犯": "...", "累犯": "...", "涉黑恶职务金融": "...", "一审判决机关": "...", "一审判决案号": "...", "罪名": "...", "一审刑期": "...",
-            "原判或现刑期起日": "...", "原判或现刑期止日": "...", "附加刑": "...", "财产性判项": "...", "犯罪事实": "...", "一审判决时间": "...",
-            "二审判决机关": "...", "二审判决案号": "...", "二审判决时间": "...", "二审判决罪名": "...", "入监日期": "...", "奖惩情况": "...",
-            "本文件记载的减刑历史": "...", "其他信息": "...", "本文件记载的日常奖惩": "..."
-        }},
-        "evidence_chain": {{
-            "作出机关": "第X页原文：'...' ",
-            "案号": "第X页原文：'...' ",
-            "姓名": "第X页原文：'...' ",
-            "别化名": "第X页原文：'...' ",
-            "一审刑期": "第X页原文：'...' "
-            // ... 这里的键必须与上方 confirmed_data 每一个键保持1:1完全对应映射 ...
-        }}
-    }}
+    必须严格输出合法的 JSON 格式，保持与下方结构完全一致，绝不要包含多余文字：
+    {dynamic_schema}
 
     【多页全卷原始文本 (已包含页面物理标记)】
     {combined_text}
@@ -301,31 +328,62 @@ def stream_extract_from_full_text(combined_text: str, target_name: str, doc_cate
         "stream": True,
         "keep_alive": 0,
         "options": {
-            "temperature": 0.0,  # 🌟 强制将创造力降为0，极致追求确定性，防止胡言乱语
-            "top_p": 0.1,
+            "temperature": 0.1, # 🌟 【修复 2】：切勿设为 0.0，避开量化模型的 NaN 崩溃死穴
+            "top_p": 0.5, # 适度调高 top_p 增加流畅度
             "num_ctx": 32768
         }
     }
 
+    # 🌟 核心破局点：如果传来了最后一页的图片，直接挂载到视觉输入中！
+    if last_page_b64:
+        payload["images"] = [last_page_b64]
+
+    has_meaningful_output = False
+
     try:
-        response = requests.post(OLLAMA_VISION_URL, json=payload, stream=True, timeout=300)
+        response = requests.post(OLLAMA_VISION_URL, json=payload, stream=True, timeout=180)
         if response.status_code == 200:
             for line in response.iter_lines():
                 if line:
                     chunk = json.loads(line.decode('utf-8'))
-
                     # 🚨 核心防线 1：拦截大模型底层的致命报错 (如 RTX 5090 显存溢出 OOM、上下文超限)
                     if "error" in chunk:
                         yield f'{{"error": "Ollama引擎底层报错: {chunk["error"]}"}}'
                         break
-
                     token = chunk.get("response", "")
-
-                    # 🚨 核心防线 2：直接丢弃 Ollama 在思考阶段发出的空字符，掐断风暴源头
                     if token:
+                        if token.strip():
+                            has_meaningful_output = True
                         yield token
 
         else:
             yield f'{{"error": "后端接口异常, 状态码: {response.status_code}"}}'
     except Exception as e:
         yield f'{{"error": "流式提取异常: {str(e)}"}}'
+
+    # ==========================================
+    # 🚨 绝对防御：静默崩溃拦截与降级抢救
+    # ==========================================
+    if not has_meaningful_output:
+        warning_msg = "\n\n⚠️【系统警报：侦测到大模型由于篇幅冲突发生静默崩溃！正在自动剥离图片、压缩模板，启动降级抢救模式...】\n\n"
+        yield warning_msg
+        print(warning_msg)
+
+        if "images" in payload:
+            del payload["images"]
+        payload["options"]["num_ctx"] = 4096
+        payload["prompt"] = prompt.replace("审视附带的图片", "仅从OCR文本中尽力")
+
+        try:
+            response = requests.post(OLLAMA_VISION_URL, json=payload, stream=True, timeout=180)
+            if response.status_code == 200:
+                for line in response.iter_lines():
+                    if line:
+                        chunk = json.loads(line.decode('utf-8'))
+                        token = chunk.get("response", "")
+                        if token:
+                            yield token
+            else:
+                yield f'{{"error": "降级模式失败, HTTP {response.status_code}"}}'
+        except Exception as e:
+            yield f'{{"error": "降级模式彻底崩溃: {str(e)}"}}'
