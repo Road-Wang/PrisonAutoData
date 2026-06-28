@@ -21,7 +21,8 @@ def render():
                                                 "罪犯收入和消费情况统计表",
                                                 "三级会议纪要生成",
                                                 "狱情分析会议纪要生成",
-                                                "释放四表 (出监鉴定评估)",])
+                                                "释放四表 (出监鉴定评估)",
+                                                "财产性判项执行情况的函",])
 
     with col1:
         target_name = st.text_input("👤 罪犯姓名：", value=st.session_state.get("current_target_name", ""))
@@ -662,3 +663,80 @@ def render():
                         )
                     else:
                         st.error(f"生成失败：{res.json().get('detail', res.text)}")
+
+    # =========== 新增：财产性判项执行函 UI (RESTful调用版) ===========
+    elif doc_type == "财产性判项执行情况的函":
+        st.subheader("📋 财产性判项执行情况的函 (一键提取并生成)")
+
+        # 表单输入
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            form_target_name = st.text_input("👤 罪犯姓名 (必填)", value=target_name, key="prop_name")
+        with c2:
+            contact_person = st.text_input("📞 联系人 (干警)", placeholder="输入您的姓名", key="prop_contact")
+        with c3:
+            issue_date = st.date_input("📅 落款日期", datetime.date.today(), key="prop_date")
+
+        st.markdown("##### ⚖️ 判项主文及附带财产清单")
+
+        tab_ocr, tab_manual = st.tabs(["📸 上传扫描件 (OCR识别)", "✍️ 手动粘贴 (最终内容)"])
+
+        with tab_ocr:
+            st.info("上传一审判决书扫描件，后台将自动提取判项内容。")
+            uploaded_files = st.file_uploader("上传图片", type=["png", "jpg", "jpeg"], accept_multiple_files=True,
+                                              key="prop_upload")
+            if st.button("🚀 开始识别提取", use_container_width=True):
+                if uploaded_files:
+                    with st.spinner("视觉大模型正在提取判决主文内容，请稍候... (请同时观察后台控制台输出)"):
+                        try:
+                            from services.vision_extractor import extract_text_from_images
+                            extracted_text = extract_text_from_images(uploaded_files)
+
+                            # 【关键拦截】如果模型提取出来的字数为 0
+                            if not extracted_text or extracted_text.strip() == "":
+                                st.error("❌ 识别完毕，但模型返回了空结果！")
+                                st.warning(
+                                    "原因排查：\n1. 请检查后台控制台（黑窗口）的打印信息。\n2. 多数本地开源多模态模型（如常规 LLaVA）对密集的A4纸中文文档识别能力极差，建议针对此类文书使用专门的 OCR 引擎（如 PaddleOCR）。")
+                            else:
+                                st.success("✅ 识别完成！请点击下方代码块右上角的【复制】图标，然后去右侧标签页粘贴。")
+                                st.code(extracted_text, language="text")
+
+                        except Exception as e:
+                            st.error(f"识别失败: {str(e)}")
+                else:
+                    st.warning("⚠️ 请先上传扫描件图片。")
+
+        with tab_manual:
+            # 恢复成最干净的文本框，不再绑定任何容易冲突的状态
+            judgment_text = st.text_area("请将刚才复制的内容粘贴在此处，并进行最终核对修改：",
+                                         height=150,
+                                         key="prop_text_area")
+
+        st.markdown("---")
+        if st.button("📄 发送请求生成 Word 文档", type="primary", use_container_width=True):
+            if not form_target_name or not judgment_text:
+                st.error("⚠️ 请填写罪犯姓名，并提供判决主文清单！")
+            else:
+                with st.spinner("正在向后端发送请求，组装并排版文档..."):
+                    # 构建要发送给后端的 JSON Payload
+                    payload = {
+                        "target_name": form_target_name,
+                        "judgment_text": judgment_text,
+                        "contact_person": contact_person,
+                        "issue_date_str": issue_date.strftime("%Y年%m月%d日")
+                    }
+                    # 请求我们在 api/doc_generator.py 里写的后端接口
+                    response = requests.post(f"{API_URL}/generate_property_execution", json=payload)
+
+                    if response.status_code == 200:
+                        st.success("🎉 生成完毕！请点击下方按钮下载。")
+                        st.download_button(
+                            label="⬇️ 点击下载《财产性判项执行情况的函》.docx",
+                            data=response.content,
+                            file_name=f"冀保狱函_{form_target_name}_财产判项调取.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        )
+                    else:
+                        # 捕获后端的 HTTPException 错误（例如找不到人员）
+                        error_detail = response.json().get("detail", "未知错误")
+                        st.error(f"❌ 生成失败: {error_detail}")

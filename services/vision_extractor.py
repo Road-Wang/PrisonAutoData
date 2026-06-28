@@ -387,3 +387,57 @@ def stream_extract_from_full_text(combined_text: str, target_name: str, doc_cate
                 yield f'{{"error": "降级模式失败, HTTP {response.status_code}"}}'
         except Exception as e:
             yield f'{{"error": "降级模式彻底崩溃: {str(e)}"}}'
+
+
+# ======== 替换 services/vision_extractor.py 底部 ========
+import base64
+import requests
+
+
+def extract_text_from_images(uploaded_files):
+    """
+    接收前端传来的多张图片，调用本地 Ollama 的 deepseek-ocr 模型进行提取
+    """
+    full_text = ""
+    # 明确指定为你使用的 deepseek-ocr
+    model_name = "deepseek-ocr"
+
+    # 针对 DeepSeek 优化的纯 OCR 提示词
+    prompt = "请识别图片中的所有中文字符，逐字输出原文。不要总结，不要省略，不要任何多余的开头或结尾解释语。"
+
+    for uploaded_file in uploaded_files:
+        # 【关键修复】将文件读取指针重置到开头，防止之前读过导致传给模型的是空图
+        uploaded_file.seek(0)
+        image_bytes = uploaded_file.read()
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+
+        payload = {
+            "model": model_name,
+            "prompt": prompt,
+            "images": [base64_image],
+            "stream": False,
+            "options": {
+                "temperature": 0.0,  # 必须设为0，强迫它做 OCR 而不是写小作文
+                "num_ctx": 4096
+            }
+        }
+
+        try:
+            response = requests.post("http://127.0.0.1:11434/api/generate", json=payload, timeout=120)
+            if response.status_code == 200:
+                result = response.json()
+                text = result.get("response", "").strip()
+
+                # 【排错利器】在后台控制台打印模型到底说了什么
+                print(f"\n--- 正在使用 {model_name} 识别文件: {uploaded_file.name} ---")
+                print(f"模型原始返回长度: {len(text)} 字符")
+                print(f"模型原始返回内容: [{text}]")
+                print("---------------------------------------\n")
+
+                full_text += text + "\n\n"
+            else:
+                raise Exception(f"Ollama API 错误，状态码: {response.status_code}。响应：{response.text}")
+        except Exception as e:
+            raise Exception(f"视觉大模型调用失败: {str(e)}")
+
+    return full_text.strip()
