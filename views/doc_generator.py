@@ -16,7 +16,7 @@ def render():
     col1, col2, col3 = st.columns([2, 2, 1])
     with col2:
         # 🌟 1. 新增“罪犯收入和消费情况统计表”选项
-        doc_type = st.selectbox("📄 文书类别：", ["《提请减刑建议书》", "罪犯个人消费明细表", "罪犯收入和消费情况统计表", "三级会议纪要生成"])
+        doc_type = st.selectbox("📄 文书类别：", ["《提请减刑建议书》", "罪犯个人消费明细表", "罪犯收入和消费情况统计表", "三级会议纪要生成", "狱情分析会议纪要生成"])
 
     with col1:
         target_name = st.text_input("👤 罪犯姓名：", value=st.session_state.get("current_target_name", ""))
@@ -383,3 +383,221 @@ def render():
                             )
                         else:
                             st.error(f"生成失败：{res.text}")
+
+    # =============== 分支 4：狱情分析会议纪要生成 (全链路流式打字机终极版) ===============
+    elif doc_type == "狱情分析会议纪要生成":
+        import os
+        import json
+
+        st.divider()
+        st.subheader("📊 狱情分析会议纪要智能生成台")
+
+        # ⚠️ 隐藏知识库文件，避免 FastAPI 触发热重启
+        KB_FILE_PATH = ".kb_standard_process.txt"
+
+        # --- 1. 知识库区域 ---
+        st.markdown("#### 1. 规则底座 (知识库)")
+        has_kb = os.path.exists(KB_FILE_PATH)
+
+        if has_kb:
+            st.success("✅ 已检测到《狱情分析会议标准化流程》知识库，无需重复上传。")
+            with st.expander("👀 查看当前生效的流程规则 (可手动更新)"):
+                with open(KB_FILE_PATH, "r", encoding="utf-8") as f:
+                    st.text(f.read())
+                if st.button("🗑️ 清除当前规则并重新上传"):
+                    os.remove(KB_FILE_PATH)
+                    st.rerun()
+            standard_process_files = []
+        else:
+            st.warning("⚠️ 首次使用，请上传《标准化流程》打印版扫描件。系统将使用 DeepSeek-OCR 流式提取并入库。")
+            standard_process_files = st.file_uploader(
+                "📄 上传标准化流程扫描件 (支持多图多页)",
+                type=["jpg", "png", "jpeg"],
+                accept_multiple_files=True
+            )
+
+        # --- 2. 数据与设定区域 ---
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            st.markdown("#### 2. 会议日期设定")
+            default_dates = "2026年5月26日, 2026年6月2日, 2026年6月9日, 2026年6月16日, 2026年6月23日"
+            dates_input = st.text_area(
+                "📅 批量会议日期 (逗号分隔)：",
+                value=default_dates
+            )
+
+        with col_d2:
+            st.markdown("#### 3. 动态手写记录上传")
+            handwritten_files = st.file_uploader(
+                "📝 批量上传本周期所有的手写记录扫描件 (页数不限)",
+                type=["jpg", "png", "jpeg"],
+                accept_multiple_files=True
+            )
+
+        # --- 3. 执行引擎与流式输出 ---
+        if st.button("🚀 开始流水线处理与流式生成", type="primary", use_container_width=True):
+            if not has_kb and not standard_process_files:
+                st.error("❌ 缺少规则底座！请先上传流程扫描件存入知识库。")
+            elif not handwritten_files:
+                st.error("❌ 请至少上传一份手写记录扫描件！")
+            else:
+                date_list = [d.strip() for d in dates_input.split(",") if d.strip()]
+
+                st.markdown("### ⚙️ 核心引擎流式执行日志")
+                main_status = st.empty()
+                log_container = st.container()
+
+                try:
+                    # ==========================================
+                    # [步骤一]：多页打印体规则入库 (流式打字机)
+                    # ==========================================
+                    main_status.info("🧠 视觉解析与大模型组稿正在初始化...")
+                    if not has_kb:
+                        main_status.warning("⏳ **[1/3] 正在启动 DeepSeek-OCR 实时剥离多页流程规则...**")
+                        standard_text = ""
+                        for idx, std_file in enumerate(standard_process_files):
+                            with log_container:
+                                with st.expander(f"👁️ 正在实时剥离第 {idx + 1} 页流程规范...", expanded=True):
+                                    ocr_box = st.empty()
+                                    current_page_text = ""
+
+                                    # 🌟 强制调用新的 stream 接口
+                                    with requests.post(
+                                            f"{API_URL}/extract_image_text_stream",
+                                            files={"file": (std_file.name, std_file.getvalue(), std_file.type)},
+                                            data={"mode": "standard"},
+                                            stream=True
+                                    ) as res_ocr:
+                                        for line in res_ocr.iter_lines():
+                                            if line:
+                                                decoded_line = line.decode('utf-8')
+                                                if decoded_line.startswith("data: "):
+                                                    data = json.loads(decoded_line[6:])
+                                                    if data['type'] == 'token':
+                                                        current_page_text += data['text']
+                                                        ocr_box.info(current_page_text + " ▌")
+                                                    elif data['type'] == 'done':
+                                                        ocr_box.info(current_page_text)
+                                                        standard_text += f"\n【制度第{idx + 1}页】:\n" + current_page_text
+                                                    elif data['type'] == 'error':
+                                                        ocr_box.error(f"识读出错: {data['text']}")
+
+                        with open(KB_FILE_PATH, "w", encoding="utf-8") as f:
+                            f.write(standard_text)
+                        with log_container:
+                            st.success("💾 **流程规则提取完毕，已永久存入知识库。**")
+                    else:
+                        with open(KB_FILE_PATH, "r", encoding="utf-8") as f:
+                            standard_text = f.read()
+                        with log_container:
+                            st.success("✔️ **已直接加载本地流程知识库。**")
+
+                    with log_container:
+                        st.divider()
+
+                        # ==========================================
+                    # [步骤二]：多页手写记录识别 (流式打字机)
+                    # ==========================================
+                    main_status.warning("⏳ **[2/3] 正在启动 Qwen3.6 视觉大脑【逐字推演】手写流水账...**")
+                    hw_text_combined = ""
+                    for idx, hw_file in enumerate(handwritten_files):
+                        with log_container:
+                            with st.expander(f"👁️ 正在实时识读第 {idx + 1} 页手写记录...", expanded=True):
+                                ocr_box = st.empty()
+                                current_page_text = ""
+
+                                # 🌟 强制调用新的 stream 接口
+                                with requests.post(
+                                        f"{API_URL}/extract_image_text_stream",
+                                        files={"file": (hw_file.name, hw_file.getvalue(), hw_file.type)},
+                                        data={"mode": "handwritten"},
+                                        stream=True
+                                ) as res_ocr:
+                                    for line in res_ocr.iter_lines():
+                                        if line:
+                                            decoded_line = line.decode('utf-8')
+                                            if decoded_line.startswith("data: "):
+                                                data = json.loads(decoded_line[6:])
+                                                if data['type'] == 'token':
+                                                    current_page_text += data['text']
+                                                    ocr_box.info(current_page_text + " ▌")
+                                                elif data['type'] == 'done':
+                                                    ocr_box.info(current_page_text)
+                                                    hw_text_combined += f"\n--- 手写记录第 {idx + 1} 页 ---\n" + current_page_text
+                                                elif data['type'] == 'error':
+                                                    ocr_box.error(f"识读出错: {data['text']}")
+
+                    with log_container:
+                        st.divider()
+
+                    # ==========================================
+                    # [步骤三]：打字机流式生成、实时可见、安全下载
+                    # ==========================================
+                    main_status.warning("⏳ **[3/3] 正在让 Qwen3.6 研读所有线索，按日期【逐个推演】并排版...**")
+
+                    with log_container:
+                        st.markdown("### 📝 智能纪要打字机实况")
+                        st.info("💡 你现在可以完全实时看到大模型的思考过程！待单篇完成，专属下载按钮会自动就绪。")
+
+                    result_container = st.container()
+
+                    for meeting_date in date_list:
+                        main_status.warning(f"⏳ **[3/3] 正在流式生成 {meeting_date} 的会议纪要...**")
+
+                        with result_container:
+                            st.markdown(f"#### 📅 {meeting_date} 会议纪要")
+                            text_box = st.empty()
+                            full_text = ""
+
+                            # 🌟 调用生成的 stream 接口
+                            with requests.post(
+                                    f"{API_URL}/build_single_meeting_stream",
+                                    data={
+                                        "standard_text": standard_text,
+                                        "handwritten_text": hw_text_combined,
+                                        "meeting_date": meeting_date
+                                    },
+                                    stream=True
+                            ) as res_meeting:
+                                for line in res_meeting.iter_lines():
+                                    if line:
+                                        decoded_line = line.decode('utf-8')
+                                        if decoded_line.startswith("data: "):
+                                            data = json.loads(decoded_line[6:])
+
+                                            if data['type'] == 'token':
+                                                full_text += data['text']
+                                                text_box.info(full_text + " ▌")
+
+                                            elif data['type'] == 'done':
+                                                text_box.info(full_text)
+                                                st.success(
+                                                    f"🎉 **{meeting_date} 纪要正文与 Word 文档已生成就绪！**")
+
+                                                docx_b64 = data['docx_base64']
+                                                safe_date = meeting_date.replace('年', '-').replace('月',
+                                                                                                    '-').replace(
+                                                    '日', '')
+                                                filename = f"狱情分析会纪要_{safe_date}.docx"
+
+                                                download_html = f'''
+                                                <a href="data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,{docx_b64}" 
+                                                   download="{filename}" 
+                                                   style="display: inline-block; padding: 0.6em 1.2em; color: white; background-color: #FF4B4B; 
+                                                          text-decoration: none; border-radius: 6px; font-weight: bold; font-family: sans-serif;
+                                                          box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px;">
+                                                   📥 点击立即下载《{filename}》
+                                                </a>
+                                                '''
+                                                st.markdown(download_html, unsafe_allow_html=True)
+                                                st.divider()
+
+                                            elif data['type'] == 'error':
+                                                text_box.error(f"❌ 生成中断：{data['text']}")
+                                                break
+
+                    main_status.success("🎉 全部任务流水线执行完毕！")
+
+                except Exception as e:
+                    main_status.error("❌ 引擎运行崩溃")
+                    st.error(f"运行过程中发生异常: {e}")

@@ -11,6 +11,7 @@ from io import BytesIO
 from datetime import datetime
 from urllib.parse import quote
 
+from PIL import Image
 import io
 import zipfile
 import pandas as pd
@@ -20,6 +21,8 @@ from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX, WD_LINE_SPACING
 from docx.enum.table import WD_ROW_HEIGHT_RULE
 from docx.oxml.ns import qn
+import requests
+import base64
 router = APIRouter()
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -665,3 +668,357 @@ async def generate_meeting_docs(payload: dict):
         headers={'Content-Disposition': 'attachment; filename="三级会议纪要_批量生成.zip"'}
     )
 
+# 确保 router 已定义，例如： router = APIRouter()
+OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+
+
+# ==========================================
+# 🚀 接口4-A：单张图片 OCR/视觉分流提取 (防排队卡死极致优化版)
+# ==========================================
+@router.post("/extract_image_text")
+async def extract_image_text(file: UploadFile = File(...), mode: str = Form(...)):
+    from PIL import Image
+    import io
+
+    img_bytes = await file.read()
+
+    print("\n" + "=" * 50)
+    print(f"🎬 [接收图片任务] 模式: {mode.upper()} | 文件名: {file.filename}")
+
+    # ==========================================
+    # 🌟 强力压缩引擎：防止视觉Token爆炸
+    # ==========================================
+    try:
+        with Image.open(io.BytesIO(img_bytes)) as img:
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            # 核心优化：1500px对27B模型仍太大，降至1024px，速度可提升3倍以上！
+            max_width = 1024
+            original_width = img.width
+
+            if img.width > max_width:
+                ratio = max_width / img.width
+                new_size = (max_width, int(img.height * ratio))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+                print(f"📉 [图片压缩] 已从 {original_width}px 极速缩放至 {max_width}px")
+            else:
+                print(f"🆗 [图片尺寸] 原图宽度 {original_width}px，无需缩放")
+
+            buffer = io.BytesIO()
+            # 质量降至 75%，进一步减少传输和解码负担，不影响认字
+            img.save(buffer, format="JPEG", quality=75)
+            img_bytes = buffer.getvalue()
+    except Exception as e:
+        print(f"⚠️ [图片压缩警告] 压缩失败，将直接使用原图: {e}")
+    # ==========================================
+
+    img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+
+    if mode == "standard":
+        print("🟢 [引擎分配] 激活 DeepSeek-OCR 进行高清打印体剥离...")
+        payload = {
+            "model": "deepseek-ocr:latest",
+            "prompt": "请仔细提取图片中的所有文字内容，不要输出废话和坐标格式。",
+            "images": [img_b64],
+            "stream": False,
+            "keep_alive": "5m",  # 保持模型热启动
+            "options": {
+                "temperature": 0.1,
+            }
+        }
+    else:
+        print("🔵 [引擎分配] 激活 Qwen3.6:27b 多模态大脑识读潦草手写体...")
+        payload = {
+            "model": "qwen3.6:27b",
+            "prompt": "请阅读这页手写工作记录。提取其中的时间、人员、事件等具体内容。尽量保留原始的狱情细节，字迹潦草处请结合语境合理推测。",
+            "images": [img_b64],
+            "stream": False,
+            "keep_alive": "5m",
+            "options": {
+                "temperature": 0.2,
+            }
+        }
+
+    try:
+        # 超时放宽到 180 秒，但在 1024px 分辨率下，通常 15-40 秒就能出结果
+        res = requests.post(OLLAMA_URL, json=payload, timeout=300)
+        if res.status_code == 200:
+            raw_text = res.json().get("response", "").strip()
+
+            if mode == "standard":
+                raw_text = re.sub(r'<\|.*?\|>', '', raw_text)
+                raw_text = re.sub(r'\[\[.*?\]\]', '', raw_text)
+
+            print(f"✅ [提取成功] 共识别到 {len(raw_text)} 个字符。")
+            print(f"🔍 [内容预览]:\n{raw_text[:200]}...\n")
+            print("=" * 50 + "\n")
+
+            return {"status": "success", "text": raw_text}
+        else:
+            print(f"❌ [模型报错] 状态码: {res.status_code} | 返回信息: {res.text}")
+            raise HTTPException(status_code=500, detail=f"模型报错状态码: {res.status_code}")
+    except Exception as e:
+        print(f"❌ [请求异常] {e}")
+        raise HTTPException(status_code=500, detail=f"图片提取失败：{e}")
+
+
+# ==========================================
+# 🚀 接口4-B：单次会议纪要流式生成与排版 (边生成边输出)
+# ==========================================
+@router.post("/build_single_meeting")
+async def build_single_meeting(
+        standard_text: str = Form(...),
+        handwritten_text: str = Form(...),
+        meeting_date: str = Form(...)
+):
+    import io
+    import base64
+    from docx import Document
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    import requests
+
+    print(f"\n📅 [正在攻坚纪要] 目标日期: {meeting_date}")
+
+    prompt = f"""
+    你是一个专业的狱政管理AI助手和公文秘书。
+    请根据会议日期【{meeting_date}】，从下述【日常流水账】中提取该日期前一周的事件，生成《狱情分析会会议纪要》。
+
+    【智能分发与兜底】
+    1. 挑出属于该周期的事件融入会议。监狱系统是刑罚执行环节，所有的管理措施必须围绕安全底线。
+    2. 若流水账中该周记录不足，必须结合当前指挥中心的“强化整改行动”要求、三大现场管理、规范执法等补充标准兜底话术，绝对不能留白。两名服刑人员不能由同一个外部社会人员汇款和通电话。
+
+    【排版与规范】
+    1. 必须使用规范执法术语。
+    2. 严格按[标准化流程]分段排版。
+    3. 纯文本输出，不少于800字。
+
+    【标准化会议流程知识库】：
+    {standard_text}
+
+    【本周期全部日常手写流水账】：
+    {handwritten_text}
+    """
+
+    payload = {
+        "model": "qwen3.6:27b",
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.4}
+    }
+
+    try:
+        res = requests.post(OLLAMA_URL, json=payload, timeout=240)
+        meeting_content = res.json().get("response", "")
+        print(f"✅ [扩写完成] {meeting_date} 纪要生成 {len(meeting_content)} 字。")
+    except Exception as e:
+        meeting_content = f"生成失败：{e}"
+        print(f"❌ [生成异常] {e}")
+
+    # 渲染 Word
+    doc = Document()
+    doc.styles['Normal'].font.name = u'仿宋'
+    doc.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), u'仿宋')
+    doc.styles['Normal'].font.size = Pt(16)
+
+    p_title = doc.add_paragraph()
+    p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run_title = p_title.add_run(f"十五监区狱情分析会会议纪要")
+    run_title.font.name = '黑体'
+    run_title._element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
+    run_title.font.size = Pt(22)
+    run_title.bold = True
+
+    p_date = doc.add_paragraph(f"会议时间：{meeting_date}")
+    p_date.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    for line in meeting_content.split('\n'):
+        line = line.strip()
+        if line:
+            p = doc.add_paragraph(line)
+            p.paragraph_format.first_line_indent = Pt(32)
+
+    doc_buffer = io.BytesIO()
+    doc.save(doc_buffer)
+    doc_bytes = doc_buffer.getvalue()
+
+    # 🌟 核心：将 Word 文件转化为 Base64 字符串，随 JSON 一同返回给前端
+    docx_b64 = base64.b64encode(doc_bytes).decode('utf-8')
+
+    return {
+        "status": "success",
+        "meeting_date": meeting_date,
+        "content_text": meeting_content,
+        "docx_base64": docx_b64
+    }
+
+
+# ==========================================
+# 🚀 接口4-C：打破黑盒的流式生成 (SSE 打字机协议)
+# ==========================================
+@router.post("/build_single_meeting_stream")
+async def build_single_meeting_stream(
+        standard_text: str = Form(...),
+        handwritten_text: str = Form(...),
+        meeting_date: str = Form(...)
+):
+    import io
+    import json
+    import base64
+    from docx import Document
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    import requests
+    from fastapi.responses import StreamingResponse
+
+    prompt = f"""
+    你是一个专业的狱政管理AI助手和公文秘书。
+    请根据会议日期【{meeting_date}】，从下述【日常流水账】中提取该日期前一周的事件，生成《狱情分析会会议纪要》。
+
+    【排版与规范】
+    1. 挑出属于该周期的事件融入会议。若记录不足，必须结合“强化整改行动”、三大现场管理等补充兜底话术，绝对不能留白。
+    2. 必须使用规范执法术语，严格按[标准化流程]分段排版。纯文本输出。
+
+    【标准化会议流程】：
+    {standard_text}
+
+    【全部日常手写流水账】：
+    {handwritten_text}
+    """
+
+    payload = {
+        "model": "qwen3.6:27b",
+        "prompt": prompt,
+        "stream": True,  # 🌟 核心：开启模型的流式输出
+        "options": {"temperature": 0.4, "num_ctx": 18192}
+    }
+
+    # 构建生成器，实时向前端推送数据
+    def event_generator():
+        full_content = ""
+        try:
+            # 与 Ollama 建立长连接，实时获取每一个 token
+            with requests.post(OLLAMA_URL, json=payload, stream=True, timeout=300) as res:
+                for line in res.iter_lines():
+                    if line:
+                        chunk = json.loads(line)
+                        text = chunk.get("response", "")
+                        full_content += text
+
+                        # 边写边发：把新生成的字推送给前端
+                        yield f"data: {json.dumps({'type': 'token', 'text': text})}\n\n"
+
+            # ====== 全文写完后，在后台闪电生成 Word 文件 ======
+            doc = Document()
+            doc.styles['Normal'].font.name = u'仿宋'
+            doc.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), u'仿宋')
+            doc.styles['Normal'].font.size = Pt(16)
+
+            p_title = doc.add_paragraph()
+            p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run_title = p_title.add_run(f"十五监区狱情分析会会议纪要")
+            run_title.font.name = '黑体'
+            run_title._element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
+            run_title.font.size = Pt(22)
+            run_title.bold = True
+
+            p_date = doc.add_paragraph(f"会议时间：{meeting_date}")
+            p_date.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+            for line in full_content.split('\n'):
+                line = line.strip()
+                if line:
+                    p = doc.add_paragraph(line)
+                    p.paragraph_format.first_line_indent = Pt(32)
+
+            doc_buffer = io.BytesIO()
+            doc.save(doc_buffer)
+            docx_b64 = base64.b64encode(doc_buffer.getvalue()).decode('utf-8')
+
+            # 发送终结信号：带着打包好的 Word Base64 编码一起发过去
+            yield f"data: {json.dumps({'type': 'done', 'docx_base64': docx_b64})}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'text': str(e)})}\n\n"
+
+    # 以流式 MIME 类型返回
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# ==========================================
+# 🚀 接口4-D：打破黑盒的流式看图识字 (SSE 协议)
+# ==========================================
+@router.post("/extract_image_text_stream")
+async def extract_image_text_stream(file: UploadFile = File(...), mode: str = Form(...)):
+    from PIL import Image
+    import io
+    import json
+    import requests
+    from fastapi.responses import StreamingResponse
+    import re
+
+    img_bytes = await file.read()
+
+    # 🌟 强力压缩引擎保持不变，防止显存爆炸
+    try:
+        with Image.open(io.BytesIO(img_bytes)) as img:
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            max_width = 1024
+            if img.width > max_width:
+                ratio = max_width / img.width
+                img = img.resize((max_width, int(img.height * ratio)), Image.Resampling.LANCZOS)
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=75)
+            img_bytes = buffer.getvalue()
+    except Exception as e:
+        pass
+
+    img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+
+    if mode == "standard":
+        payload = {
+            "model": "deepseek-ocr:latest",
+            "prompt": "请仔细提取图片中的所有文字内容，不要输出废话和坐标格式。",
+            "images": [img_b64],
+            "stream": True,  # 🌟 开启流式识图
+            "keep_alive": "5m",
+            "options": {"temperature": 0.1, "num_ctx": 18192}
+        }
+    else:
+        payload = {
+            "model": "qwen3.6:27b",
+            "prompt": "请阅读这页手写工作记录。提取其中的时间、人员、事件等具体内容。尽量保留原始的狱情细节，字迹潦草处请结合语境合理推测。",
+            "images": [img_b64],
+            "stream": True,  # 🌟 开启流式识图
+            "keep_alive": "5m",
+            "options": {"temperature": 0.2, "num_ctx": 18192}
+        }
+
+    def vision_event_generator():
+        full_text = ""
+        try:
+            with requests.post(OLLAMA_URL, json=payload, stream=True, timeout=300) as res:
+                for line in res.iter_lines():
+                    if line:
+                        chunk = json.loads(line)
+                        text = chunk.get("response", "")
+
+                        # Deepseek-ocr 清洗
+                        if mode == "standard":
+                            text = re.sub(r'<\|.*?\|>', '', text)
+                            text = re.sub(r'\[\[.*?\]\]', '', text)
+
+                        full_text += text
+                        if text:  # 只要有字就推给前端
+                            yield f"data: {json.dumps({'type': 'token', 'text': text})}\n\n"
+
+            # 读完这张图后，发送完成信号
+            yield f"data: {json.dumps({'type': 'done', 'full_text': full_text})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'text': str(e)})}\n\n"
+
+    return StreamingResponse(vision_event_generator(), media_type="text/event-stream")
