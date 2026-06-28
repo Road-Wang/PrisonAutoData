@@ -392,43 +392,51 @@ def stream_extract_from_full_text(combined_text: str, target_name: str, doc_cate
 # ======== 替换 services/vision_extractor.py 底部 ========
 import base64
 import requests
+import io
+from PIL import Image  # 引入 PIL 进行图片清洗
 
 
 def extract_text_from_images(uploaded_files):
     """
-    接收前端传来的多张图片，调用本地 Ollama 的 deepseek-ocr 模型进行提取
+    接收前端传来的多张图片，清洗后调用 deepseek-ocr 提取
     """
     full_text = ""
-    # 明确指定为你使用的 deepseek-ocr
     model_name = "deepseek-ocr"
 
-    # 针对 DeepSeek 优化的纯 OCR 提示词
-    prompt = "请识别图片中的所有中文字符，逐字输出原文。不要总结，不要省略，不要任何多余的开头或结尾解释语。"
+    # 【修复1】大道至简：去掉复杂的否定指令，回归最基础的 OCR 提示词
+    prompt = "请提取并输出图片中的所有文字。"
 
     for uploaded_file in uploaded_files:
-        # 【关键修复】将文件读取指针重置到开头，防止之前读过导致传给模型的是空图
-        uploaded_file.seek(0)
-        image_bytes = uploaded_file.read()
-        base64_image = base64.b64encode(image_bytes).decode('utf-8')
-
-        payload = {
-            "model": model_name,
-            "prompt": prompt,
-            "images": [base64_image],
-            "stream": False,
-            "options": {
-                "temperature": 0.0,  # 必须设为0，强迫它做 OCR 而不是写小作文
-                "num_ctx": 4096
-            }
-        }
-
         try:
+            uploaded_file.seek(0)
+
+            # 【修复2】图片清洗：不管前端传上来的是什么牛鬼蛇神(RGBA/透明底/异常色彩空间)
+            # 全都用 PIL 强行转成最干净的纯标准 RGB 格式
+            img = Image.open(uploaded_file)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            # 重新将其转为 JPEG 字节流供模型读取
+            buffered = io.BytesIO()
+            img.save(buffered, format="JPEG")
+            base64_image = base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+            payload = {
+                "model": model_name,
+                "prompt": prompt,
+                "images": [base64_image],
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,  # 【修复3】避免 0.0 触发模型死锁不输出
+                    "num_ctx": 4096
+                }
+            }
+
             response = requests.post("http://127.0.0.1:11434/api/generate", json=payload, timeout=120)
             if response.status_code == 200:
                 result = response.json()
                 text = result.get("response", "").strip()
 
-                # 【排错利器】在后台控制台打印模型到底说了什么
                 print(f"\n--- 正在使用 {model_name} 识别文件: {uploaded_file.name} ---")
                 print(f"模型原始返回长度: {len(text)} 字符")
                 print(f"模型原始返回内容: [{text}]")
@@ -437,7 +445,8 @@ def extract_text_from_images(uploaded_files):
                 full_text += text + "\n\n"
             else:
                 raise Exception(f"Ollama API 错误，状态码: {response.status_code}。响应：{response.text}")
+
         except Exception as e:
-            raise Exception(f"视觉大模型调用失败: {str(e)}")
+            raise Exception(f"处理或识别图片失败: {str(e)}")
 
     return full_text.strip()

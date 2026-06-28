@@ -1349,7 +1349,10 @@ async def generate_release_forms(payload: dict):
     )
 
 
-# 1. 定义前端传过来的数据模型
+# ======== 将以下代码替换 api/doc_generator.py 底部的相应路由 ========
+from docxtpl import DocxTemplate
+
+
 class PropertyExecutionRequest(BaseModel):
     target_name: str
     judgment_text: str
@@ -1357,11 +1360,10 @@ class PropertyExecutionRequest(BaseModel):
     issue_date_str: str
 
 
-# 2. 新增生成财产性判项执行函的 API 接口
 @router.post("/generate_property_execution")
 async def generate_property_execution(req: PropertyExecutionRequest):
     try:
-        # --- 1. 连接数据库获取基础信息 ---
+        # 1. 连接数据库获取基础信息
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -1374,16 +1376,8 @@ async def generate_property_execution(req: PropertyExecutionRequest):
             raise HTTPException(status_code=404, detail=f"在数据库中未找到罪犯【{req.target_name}】的记录。")
 
         keys = record.keys()
-        court_name = record["一审法院"] if "一审法院" in keys else (
-            record["一审机关"] if "一审机关" in keys else "原审人民法院")
-        gender = record["性别"] if "性别" in keys else "男"
-        id_card = record["身份证号"] if "身份证号" in keys else "未查到身份证"
-        address = record["户籍所在地"] if "户籍所在地" in keys else (
-            record["户籍地"] if "户籍地" in keys else "未查到户籍地")
-        case_number = record["一审案号"] if "一审案号" in keys else (
-            record["一审字号"] if "一审字号" in keys else "未查到案号")
 
-        # 计算年龄
+        # 自动计算年龄
         birth = str(record["出生日期"]) if "出生日期" in keys else ""
         age = "XX"
         if birth and len(birth) >= 4:
@@ -1392,64 +1386,32 @@ async def generate_property_execution(req: PropertyExecutionRequest):
             except:
                 pass
 
-        # --- 2. 初始化Word并严格设置页边距 ---
-        doc = Document()
-        for section in doc.sections:
-            section.top_margin = Cm(3.7)
-            section.bottom_margin = Cm(3.5)
-            section.left_margin = Cm(2.8)
-            section.right_margin = Cm(2.6)
+        # 2. 组装要填入模板的数据字典 (这里的 Key 必须与你 Word 里 {{ 变量名 }} 完全一致)
+        context = {
+            "target_name": req.target_name,
+            "court_name": record["一审法院"] if "一审法院" in keys else (
+                record["一审机关"] if "一审机关" in keys else "原审人民法院"),
+            "gender": record["性别"] if "性别" in keys else "男",
+            "age": age,
+            "id_card": record["身份证"] if "身份证" in keys else "未查到身份证",
+            "address": record["籍贯/国籍"] if "籍贯/国籍" in keys else (
+                record["户籍地"] if "户籍地" in keys else "未查到户籍地"),
+            "case_number": record["一审案号"] if "一审案号" in keys else (
+                record["一审字号"] if "一审字号" in keys else "未查到案号"),
+            "judgment_text": req.judgment_text,
+            "issue_date_str": req.issue_date_str,
+            "contact_person": req.contact_person
+        }
 
-        # 辅助排版函数
-        def set_font(run, name, size):
-            run.font.name = name
-            run._element.rPr.rFonts.set(qn('w:eastAsia'), name)
-            run.font.size = Pt(size)
+        # 3. 加载模板并渲染
+        template_path = os.path.join(BASE_DIR, "templates", "财产判项函模板.docx")
+        if not os.path.exists(template_path):
+            raise HTTPException(status_code=500, detail="找不到模板文件，请确认 templates/财产判项函模板.docx 存在。")
 
-        def add_para(text, font_name, size, line_spacing, indent=0, align=WD_ALIGN_PARAGRAPH.JUSTIFY):
-            p = doc.add_paragraph()
-            p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.EXACTLY
-            p.paragraph_format.line_spacing = Pt(line_spacing)
-            if indent: p.paragraph_format.first_line_indent = Pt(indent)
-            p.alignment = align
-            run = p.add_run(text)
-            set_font(run, font_name, size)
-            return p
+        doc = DocxTemplate(template_path)
+        doc.render(context)
 
-        # --- 3. 开始向 Word 写入内容 (严格套用格式) ---
-        add_para("河北省保定监狱", "方正小标宋简体", 22, line_spacing=32, align=WD_ALIGN_PARAGRAPH.CENTER)
-        add_para(f"关于调取罪犯{req.target_name}财产性判项执行情况的函", "方正小标宋简体", 22, line_spacing=32,
-                 align=WD_ALIGN_PARAGRAPH.CENTER)
-
-        add_para(f"{court_name}：", "仿宋_GB2312", 16, line_spacing=28)
-
-        intro_text = (
-            f"我狱因办理罪犯减刑、假释案件需要，根据最高人民法院《关于办理减刑、假释案件审查财产性判项执行问题的规定》"
-            f"（法释〔2024〕5号）（以下简称《规定》）第六条、第七条、第十三条,以及两高两部《关于加强减刑、假释案件实质化审理的意见》"
-            f"（法发〔2021〕31号）第15条有关规定，特向贵院调取罪犯{req.target_name}的财产性判项执行情况, 望贵院予以协助, 并在收到本函后及时予以回复。")
-        add_para(intro_text, "仿宋_GB2312", 16, line_spacing=28, indent=32)
-
-        add_para("一、罪犯基本信息", "黑体", 16, line_spacing=28, indent=32)
-        add_para(
-            f"罪犯{req.target_name}，性别{gender}，年龄{age}岁，身份证号码{id_card}，户籍地{address}，现服刑于河北省保定监狱。",
-            "仿宋_GB2312", 16, line_spacing=28, indent=32)
-
-        add_para("二、原判刑罚的执行依据", "黑体", 16, line_spacing=28, indent=32)
-        add_para(f"生效刑事裁判文书案号：{case_number}。", "仿宋_GB2312", 16, line_spacing=28, indent=32)
-        add_para(f"刑事裁判判项主文及附带涉案财产清单：{req.judgment_text}", "仿宋_GB2312", 16, line_spacing=28,
-                 indent=32)
-
-        add_para("三、函请调取的执行情况", "黑体", 16, line_spacing=28, indent=32)
-        add_para(
-            "1.罪犯财产性判项执行履行情况；\n2.罪犯财产性判项未履行完毕的，是否具备履行能力及裁定书；\n3.其他相关情况。",
-            "仿宋_GB2312", 16, line_spacing=28, indent=32)
-
-        add_para(f"\n河北省保定监狱\n{req.issue_date_str}", "仿宋_GB2312", 16, line_spacing=28,
-                 align=WD_ALIGN_PARAGRAPH.RIGHT)
-        add_para(f"\n联系人：{req.contact_person}    联系电话：0312-XXXXXXX（请根据实际修改）", "仿宋_GB2312", 16,
-                 line_spacing=28, indent=32)
-
-        # --- 4. 生成内存文件流返回 ---
+        # 4. 生成内存文件流返回
         file_stream = io.BytesIO()
         doc.save(file_stream)
         file_stream.seek(0)
