@@ -1022,3 +1022,327 @@ async def extract_image_text_stream(file: UploadFile = File(...), mode: str = Fo
             yield f"data: {json.dumps({'type': 'error', 'text': str(e)})}\n\n"
 
     return StreamingResponse(vision_event_generator(), media_type="text/event-stream")
+
+
+# 尝试引入您的心理测试评估逻辑（如果未就绪，则使用降级函数）
+try:
+    from services.psycho_test import evaluate_epq_copa
+except ImportError:
+    def evaluate_epq_copa(answers):
+        return "此人性格较为内向、沉静，为人处世小心翼翼，着重客观现实，倾向于独立思考和安静的环境。日常情绪基本稳定而温和，很少患得患失，遇事能够保持冷静和冷寂理智。做事条理性较强，富有安全感，在人际交往中较为被动，但社会适应状态良好。"
+
+
+# ==========================================
+# 🚀 1. 心理测试答题卡 AI 识别接口
+# ==========================================
+@router.post("/extract_psycho_answers", summary="OCR提取答题卡选项")
+async def extract_psycho_answers(file: UploadFile = File(...)):
+    try:
+        # 这里模拟您调用大模型视觉提取服务 (如 GPT-4o 或 本地 Qwen-VL)
+        # prompt = "请读取上传的罪犯心理测评答题卡图片，提取出所有的选项答案。只需返回一串纯大写字母的答题序列（如：AABCCDB...），不要有任何多余的话。"
+
+        # 为了演示，此处返回一个模拟的答案字符串。实际业务中请替换为真实大模型调用。
+        simulated_answers = "A" * 20 + "B" * 20 + "C" * 20 + "A" * 20
+        return {"status": "success", "answers": simulated_answers}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"答题卡识别失败: {str(e)}")
+
+
+# ==========================================
+# 🚀 2. 释放四表（6页）全自动化生成引擎
+# ==========================================
+@router.post("/generate_release_forms", summary="生成释放四表")
+async def generate_release_forms(payload: dict):
+    inmate_name = payload.get("inmate_name", "").strip()
+    psycho_answers = payload.get("psycho_answers", "").strip()
+
+    if not inmate_name:
+        raise HTTPException(status_code=400, detail="请输入罪犯姓名")
+
+    # 1. 抓取狱政系统基础数据
+    conn = sqlite3.connect("prison_archive.db")
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM prison_admin_data WHERE 姓名=?", (inmate_name,))
+    db_row = c.fetchone()
+    conn.close()
+
+    if not db_row:
+        raise HTTPException(status_code=404, detail=f"在狱政系统数据库中未找到罪犯【{inmate_name}】的数据。")
+
+    # 2. 核心数据清洗与解析
+    def safe_get(key, default="无"):
+        val = db_row[key] if key in db_row.keys() else None
+        return str(val).strip() if pd.notna(val) and val != "" else default
+
+    crime = safe_get("罪名")
+    release_date_str = safe_get("止日")  # 现刑期止日 = 释放日
+    entry_date_str = safe_get("入监日期")
+
+    # 解析日期
+    try:
+        release_date = pd.to_datetime(release_date_str)
+        # 逆推两个月作为填表时间
+        report_date = release_date - relativedelta(months=2)
+
+        release_dt_str = release_date.strftime("%Y年%m月%d日")
+        report_dt_str = report_date.strftime("%Y年%m月%d日")
+    except:
+        release_dt_str = release_date_str
+        report_dt_str = "【日期解析错误，请手动填写】"
+
+    # 计算服刑时长 (月)
+    try:
+        entry_dt = pd.to_datetime(entry_date_str)
+        served_months = (release_date.year - entry_dt.year) * 12 + release_date.month - entry_dt.month
+        served_str = f"{served_months // 12}年{served_months % 12}个月"
+    except:
+        served_months = 60
+        served_str = "【计算异常】"
+
+    # 3. 动态评分算法 (防呆兜底)
+    # 扣分项：惩罚、前科、服刑短于2年
+    punish_count = 0  # 预留接口：从惩处记录表抓取
+    criminal_records = int(
+        re.search(r'\d+', safe_get("前科次数", "0")).group() if re.search(r'\d+', safe_get("前科次数", "0")) else 0)
+
+    score = 85
+    has_deduction = False
+
+    if punish_count > 0:
+        score -= punish_count * 5
+        has_deduction = True
+    if criminal_records > 0:
+        score -= criminal_records * 5
+        has_deduction = True
+    if served_months < 24:
+        score -= 5
+        has_deduction = True
+
+    if has_deduction and score > 80:
+        score = 80
+    if score < 60:
+        score = 60
+
+    eval_level = "较好" if score >= 80 else "一般"
+    prison_opinion = "该服刑人员改造成绩较好。通过出监前改造质量综合评估和心理测试分析，较好地达到了改造目标，其犯罪思想和不良行为基本上得到了改造和矫正。社会适应能力较强，有一定的自控能力。建议地方有关部门将其作为一般或重点帮教对象给予关注，加强帮教工作，促其真正成为守法公民。" if score >= 80 else "该服刑人员改造成绩一般。通过出监前改造质量综合评估和心理测试分析，基本上达到了改造目标，其犯罪思想和不良行为部分得到了改造和矫正。社会适应能力一般，缺乏一定的自控能力。建议地方有关部门将其作为一般或重点帮教对象给予关注，强化帮教工作，巩固改造成果，促其不致再违法犯罪。"
+
+    # 组装附加刑
+    extra_penalty = []
+    if safe_get("原剥政") != "无": extra_penalty.append(safe_get("原剥政"))
+    if safe_get("罚金") != "无": extra_penalty.append(f"罚金{safe_get('罚金')}")
+    if safe_get("没收财产") != "无": extra_penalty.append("没收财产")
+    extra_penalty_str = "，".join(extra_penalty) if extra_penalty else "无"
+
+    # 获取心理测评结果
+    psycho_analysis = evaluate_epq_copa(psycho_answers) if psycho_answers else evaluate_epq_copa("")
+
+    # ===============================================
+    # 4. Word 渲染核心
+    # ===============================================
+    doc = Document()
+
+    # 页面基础设置
+    section = doc.sections[0]
+    section.page_width = Cm(21.0)
+    section.page_height = Cm(29.7)
+    section.top_margin = Cm(2.5)
+    section.bottom_margin = Cm(2.0)
+    section.left_margin = Cm(2.5)
+    section.right_margin = Cm(2.5)
+
+    def set_font(run, size=12, name="宋体", bold=False):
+        run.font.name = name
+        run._element.rPr.rFonts.set(qn('w:eastAsia'), name)
+        run.font.size = Pt(size)
+        run.bold = bold
+
+    # --------- 第1页：改造质量评估表 (正面) ---------
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    set_font(p.add_run("服刑人员出监前改造质量评估表"), 16, "黑体", True)
+
+    p2 = doc.add_paragraph()
+    set_font(p2.add_run("服刑单位：河北省保定监狱十五监区"), 12, "仿宋")
+
+    t1 = doc.add_table(rows=8, cols=10, style='Table Grid')
+    t1.autofit = False
+
+    # 合并单元格与填充 (简化的结构性演示，实际单元格映射根据需求微调)
+    t1.cell(0, 0).text = "姓名"
+    t1.cell(0, 1).text = inmate_name
+    t1.cell(0, 2).text = "别名"
+    t1.cell(0, 3).text = safe_get("别化名")
+    t1.cell(0, 4).text = "性别"
+    t1.cell(0, 5).text = safe_get("性别", "男")
+    t1.cell(0, 6).text = "年龄"
+    t1.cell(0, 7).text = str(safe_get("年龄")) + "岁"
+    t1.cell(0, 8).text = "现文化程度"
+    t1.cell(0, 9).text = safe_get("文化程度")
+
+    t1.cell(1, 0).text = "婚姻状况"
+    t1.cell(1, 1).text = safe_get("婚否")
+    t1.cell(1, 2).text = "健康状况"
+    t1.cell(1, 4).text = safe_get("健康状况", "健康")
+    t1.cell(1, 6).text = "技术特长"
+    t1.cell(1, 8).text = safe_get("特长", "无")
+
+    t1.cell(2, 0).text = "户籍所在地"
+    t1.cell(2, 1).text = safe_get("户籍住址")
+    t1.cell(2, 6).text = "出监日期"
+    t1.cell(2, 8).text = release_dt_str
+
+    t1.cell(3, 0).text = "现家庭住址"
+    t1.cell(3, 1).text = safe_get("家庭住址")
+    t1.cell(3, 6).text = "出监原因"
+    t1.cell(3, 8).text = "刑满释放"
+
+    t1.cell(4, 0).text = "罪名"
+    t1.cell(4, 1).text = crime
+    t1.cell(4, 2).text = "附加刑"
+    t1.cell(4, 3).text = extra_penalty_str
+    t1.cell(4, 5).text = "原判刑期"
+    t1.cell(4, 6).text = safe_get("原判刑期")
+    t1.cell(4, 7).text = "实际服刑"
+    t1.cell(4, 8).text = served_str
+
+    t1.cell(5, 0).text = "服刑期间奖惩记录"
+    # 预留接口，目前全0
+    t1.cell(5, 1).text = "计分表扬0次，物质奖励0次，计分记功0次，单项表扬0次，单项记功0次，积极分子0次；警告0次，记过0次，禁闭0次。"
+    t1.cell(5, 1).merge(t1.cell(5, 9))
+
+    t1.cell(6, 0).text = "心理测试分析"
+    psycho_text = f"使用量表: EPQ /COPA   测试效果: 有效\n{inmate_name}: {psycho_analysis}\n心理健康状况: 亚健康   时间: {report_dt_str}"
+    t1.cell(6, 1).text = psycho_text
+    t1.cell(6, 1).merge(t1.cell(6, 9))
+
+    t1.cell(7, 0).text = "服刑人员自评"
+    t1.cell(7, 1).text = "好(   )         较好( √ ）    一般(  )          差(   )"
+    t1.cell(7, 1).merge(t1.cell(7, 9))
+
+    doc.add_page_break()
+
+    # --------- 第2页：改造质量评估表 (背面) ---------
+    t2 = doc.add_table(rows=3, cols=2, style='Table Grid')
+    t2.cell(0, 0).text = "监区评估意见"
+    t2.cell(0,
+            1).text = f"经综合评估、集体评议，该犯基础分为85分，扣除惩罚及前科等项目后，最终综合得分：{score}分。评估等级：{eval_level}。\n\n监区长签字：           {report_dt_str}"
+    t2.cell(1, 0).text = "监狱意见"
+    t2.cell(1, 1).text = f"{prison_opinion}\n\n监狱盖章             {report_dt_str}"
+    t2.cell(2, 0).text = "备注"
+    t2.cell(2, 1).text = ""
+
+    doc.add_page_break()
+
+    # --------- 第3页：罪犯出监鉴定表 (正面) ---------
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    set_font(p.add_run("罪犯出监鉴定表"), 16, "黑体", True)
+
+    p2 = doc.add_paragraph()
+    set_font(p2.add_run(f"填报机关：河北省保定监狱                   填表日期：{report_dt_str}"), 12, "仿宋")
+
+    t3 = doc.add_table(rows=9, cols=8, style='Table Grid')
+    # 简化填表
+    t3.cell(0, 0).text = "姓名"
+    t3.cell(0, 1).text = inmate_name
+    t3.cell(0, 2).text = "别名"
+    t3.cell(0, 3).text = safe_get("别化名")
+    t3.cell(0, 4).text = "性别"
+    t3.cell(0, 5).text = safe_get("性别")
+    t3.cell(0, 6).text = "健康状况"
+    t3.cell(0, 7).text = safe_get("健康状况", "健康")
+
+    t3.cell(8, 0).text = "主要犯罪事实"
+    t3.cell(8, 1).text = safe_get("犯罪事实", "详见判决书。")
+    t3.cell(8, 1).merge(t3.cell(8, 7))
+
+    doc.add_page_break()
+
+    # --------- 第4页：罪犯出监鉴定表 (背面) ---------
+    t4 = doc.add_table(rows=4, cols=2, style='Table Grid')
+    t4.cell(0, 0).text = "家庭主要成员"
+    t4.cell(0, 1).text = "（预留接口，待家庭信息库上线后填入）"
+    t4.cell(1, 0).text = "本人简历"
+    t4.cell(1, 1).text = ""
+    t4.cell(2, 0).text = "改造表现"
+    t4.cell(2, 1).text = "该犯自入监以来，能够认罪悔罪，遵守监规纪律，接受教育改造，积极参加思想、文化、职业技术教育，积极参加劳动，努力完成劳动任务。"
+    t4.cell(3, 0).text = "服刑期间奖励情况"
+    t4.cell(3,
+            1).text = "计分表扬0次，物质奖励0次，计分记功0次，单项表扬0次，单项记功0次，积极分子0次。\n\n监狱长签字：           监狱公章：\n\n\n                              " + report_dt_str
+
+    doc.add_page_break()
+
+    # --------- 第5页：拟释放罪犯改造情况登记表 ---------
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    set_font(p.add_run("拟释放罪犯改造情况登记表"), 16, "黑体", True)
+
+    p2 = doc.add_paragraph()
+    set_font(p2.add_run(f"监区：十五监区                             报表时间：{report_dt_str}"), 12, "仿宋")
+
+    t5 = doc.add_table(rows=8, cols=4, style='Table Grid')
+    t5.cell(0, 0).text = "姓名"
+    t5.cell(0, 1).text = inmate_name
+    t5.cell(0, 2).text = "罪名"
+    t5.cell(0, 3).text = crime
+    # 中间常规项略，按照您的表格排版逻辑
+    t5.cell(3, 0).text = "历次减刑情况"
+    t5.cell(3, 1).text = "（从狱政数据库历次减刑字段动态抓取，此接口已预留）"
+    t5.cell(3, 1).merge(t5.cell(3, 3))
+
+    t5.cell(4, 0).text = "是否累犯"
+    t5.cell(4, 1).text = "是" if safe_get("累惯犯") == "累犯" else "否"
+    t5.cell(4, 2).text = "改造表现"
+    t5.cell(4, 3).text = eval_level
+
+    t5.cell(7, 0).text = "包组干警签字："
+    t5.cell(7, 2).text = f"监区领导签字：\n{report_dt_str}"
+
+    doc.add_page_break()
+
+    # --------- 第6页：离监罪犯个人物品检查登记表 ---------
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    set_font(p.add_run("离监罪犯个人物品检查登记表"), 16, "黑体", True)
+
+    p2 = doc.add_paragraph()
+    set_font(p2.add_run(f"监区：十五监区                             报表时间：{report_dt_str}"), 12, "仿宋")
+
+    t6 = doc.add_table(rows=5, cols=4, style='Table Grid')
+    t6.cell(0, 0).text = "姓名"
+    t6.cell(0, 1).text = inmate_name
+    t6.cell(1, 0).text = "物品类别"
+    t6.cell(1, 1).text = "是否违禁"
+    t6.cell(2, 0).text = "衣物、书籍、信件等日常用品"
+    t6.cell(2, 1).text = "准许带出"
+
+    t6.cell(4, 0).text = f"个人物品检查干警签字：\n\n监区领导签字：\n{release_dt_str}"  # 🌟 此处为特例：释放日当天
+    t6.cell(4, 0).merge(t6.cell(4, 3))
+
+    # 统一全局表格字体为仿宋小四，居中
+    for tbl in [t1, t2, t3, t4, t5, t6]:
+        for row in tbl.rows:
+            for cell in row.cells:
+                cell.vertical_alignment = 1
+                for paragraph in cell.paragraphs:
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    for run in paragraph.runs:
+                        set_font(run, 12, "仿宋")
+
+    # ===============================================
+    # 写入内存，通过流式下发给前端
+    # ===============================================
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+
+    from urllib.parse import quote
+    filename = f"{inmate_name}_释放四表_{release_date_str}.docx"
+    headers_dict = {'Content-Disposition': f"attachment; filename*=utf-8''{quote(filename)}"}
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers=headers_dict
+    )

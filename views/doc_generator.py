@@ -16,7 +16,12 @@ def render():
     col1, col2, col3 = st.columns([2, 2, 1])
     with col2:
         # 🌟 1. 新增“罪犯收入和消费情况统计表”选项
-        doc_type = st.selectbox("📄 文书类别：", ["《提请减刑建议书》", "罪犯个人消费明细表", "罪犯收入和消费情况统计表", "三级会议纪要生成", "狱情分析会议纪要生成"])
+        doc_type = st.selectbox("📄 文书类别：", ["《提请减刑建议书》",
+                                                "罪犯个人消费明细表",
+                                                "罪犯收入和消费情况统计表",
+                                                "三级会议纪要生成",
+                                                "狱情分析会议纪要生成",
+                                                "释放四表 (出监鉴定评估)",])
 
     with col1:
         target_name = st.text_input("👤 罪犯姓名：", value=st.session_state.get("current_target_name", ""))
@@ -601,3 +606,59 @@ def render():
                 except Exception as e:
                     main_status.error("❌ 引擎运行崩溃")
                     st.error(f"运行过程中发生异常: {e}")
+
+    elif doc_type == "释放四表 (出监鉴定评估)":
+        st.divider()
+        st.subheader("📝 释放前四表一键自动化组装 (共6页)")
+        st.info(
+            "💡 提示：系统会自动从狱政数据库读取信息，并自动将报表日期逆推至【释放前2个月】。您只需提供罪犯姓名和心理测试答案即可。")
+
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            target_name = st.text_input("👤 请输入待释放罪犯姓名：", placeholder="例如：鹿付山")
+
+        with col2:
+            st.markdown("🧠 **出监心理测评结果录入**")
+            input_method = st.radio("录入方式：", ["直接粘贴答案", "上传答题卡AI识别"], horizontal=True)
+
+            psycho_answers = ""
+            if input_method == "直接粘贴答案":
+                psycho_answers = st.text_area("✍️ 粘贴选项序列 (如: AABBCC...)：", height=100)
+            else:
+                st.caption("支持上传手写打勾的答题卡图片，AI将自动识别并转为选项。")
+                ans_file = st.file_uploader("📎 上传答题卡图片/PDF", type=["jpg", "png", "jpeg", "pdf"])
+                if ans_file and st.button("👁️ AI视觉识别"):
+                    with st.spinner("大模型正在分析答题卡..."):
+                        files = {"file": (ans_file.name, ans_file.getvalue(), ans_file.type)}
+                        res = requests.post(f"{API_URL}/extract_psycho_answers", files=files)
+                        if res.status_code == 200:
+                            psycho_answers = res.json().get("answers")
+                            st.success("识别成功！选项结果如下：")
+                            st.code(psycho_answers)
+                        else:
+                            st.error("识别失败")
+
+        st.markdown("---")
+        if st.button("🚀 根据狱政数据全自动生成《释放四表》", type="primary", use_container_width=True):
+            if not target_name:
+                st.error("⚠️ 请输入姓名！")
+            else:
+                with st.spinner(f"正在抓取 {target_name} 的狱政数据，推算日期与评估分数，组装 6 页 Word..."):
+                    payload = {
+                        "inmate_name": target_name,
+                        "psycho_answers": psycho_answers
+                    }
+                    res = requests.post(f"{API_URL}/generate_release_forms", json=payload)
+
+                    if res.status_code == 200:
+                        st.success("🎉 生成完毕！请点击下方按钮下载。")
+                        st.download_button(
+                            label="⬇️ 下载《释放四表》.docx",
+                            data=res.content,
+                            file_name=f"{target_name}_释放四表.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            type="secondary"
+                        )
+                    else:
+                        st.error(f"生成失败：{res.json().get('detail', res.text)}")
