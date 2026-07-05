@@ -22,7 +22,8 @@ def render():
                                                 "三级会议纪要生成",
                                                 "狱情分析会议纪要生成",
                                                 "释放四表 (出监鉴定评估)",
-                                                "财产性判项执行情况的函",])
+                                                "财产性判项执行情况的函",
+                                                "计分考核表标题修改",])
 
     with col1:
         target_name = st.text_input("👤 罪犯姓名：", value=st.session_state.get("current_target_name", ""))
@@ -740,3 +741,92 @@ def render():
                         # 捕获后端的 HTTPException 错误（例如找不到人员）
                         error_detail = response.json().get("detail", "未知错误")
                         st.error(f"❌ 生成失败: {error_detail}")
+
+    # =============== 新增分支：计分考核表 PDF 标题批量修改 ===============
+    elif doc_type == "计分考核表标题修改":
+        st.divider()
+        st.subheader("🖍️ 计分考核表 PDF 标题智能修改工具 (支持批量)")
+        st.info("💡 系统将擦除原标题并重新居中打印。已配置双轨动态高度，支持多选文件批量处理，自动打包为 ZIP 下载！")
+
+        # 🌟 核心修改 1：开启 accept_multiple_files=True 允许批量选择文件
+        pdf_files = st.file_uploader("📂 批量上传原始 PDF 报表", type=["pdf"], accept_multiple_files=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("#### 🎯 目标设置")
+            doc_sub_type = st.radio("生成目标类别：", ["汇总表", "明细表"], horizontal=True)
+            # 自动联动所需的新标题
+            default_new_title = "罪犯计分考核汇总表" if doc_sub_type == "汇总表" else "罪犯计分考核明细表"
+            new_title_input = st.text_input("✨ 将替换为以下新标题：", value=default_new_title)
+            font_size = st.number_input("🅰️ 标题字号 (默认 22，通常为二号字)", value=22)
+
+        with col2:
+            st.markdown("#### ⚙️ 抹除与定位模式")
+            mode = st.selectbox("选择底层处理模式：",
+                                ["智能定位 (根据原标题文字自动找寻)", "手动强制 (根据页面高度坐标盲目抹除)"])
+
+            old_title_input = ""
+            wipe_y0 = 20.0
+            wipe_y1 = 90.0
+
+            if "智能" in mode:
+                # 依然默认找寻“计分考核”来定位
+                old_title_input = st.text_input("🔍 原标题包含文字 (用于系统追踪坐标)：", value="计分考核")
+                st.caption("🤖 系统会自动在第一页寻找包含该文字的行，将其整行抹白。")
+            else:
+                st.warning("⚠️ 如果是纯图片扫描件，请指定要抹白的纵向坐标范围 (Y轴)：")
+                col_y1, col_y2 = st.columns(2)
+                with col_y1:
+                    wipe_y0 = st.number_input("顶部边界 (Y0)", value=20.0, step=10.0)
+                with col_y2:
+                    wipe_y1 = st.number_input("底部边界 (Y1)", value=90.0, step=10.0)
+
+        if st.button("🚀 开始批量擦除并生成", type="primary", use_container_width=True):
+            if not pdf_files:
+                st.error("⚠️ 请至少上传一个需要处理的 PDF 文件")
+            else:
+                with st.spinner(f"正在启动重绘引擎，批量处理 {len(pdf_files)} 个文档..."):
+                    # 🌟 核心修改 2：构建多文件上传的数据包 (List[Tuple])
+                    files_payload = [
+                        ("files", (file.name, file.getvalue(), "application/pdf")) for file in pdf_files
+                    ]
+
+                    data = {
+                        "mode": "auto" if "智能" in mode else "manual",
+                        "doc_sub_type": doc_sub_type,  # 👈 把报表类别传给后端用于区分 offset
+                        "old_title": old_title_input,
+                        "new_title": new_title_input,
+                        "font_size": font_size,
+                        "wipe_y0": wipe_y0,
+                        "wipe_y1": wipe_y1
+                    }
+
+                    try:
+                        # 请求批量处理的新接口 modify_pdf_title_batch
+                        res = requests.post(f"{API_URL}/modify_pdf_title_batch", files=files_payload, data=data)
+
+                        if res.status_code == 200:
+                            st.success("🎉 PDF 批量修改成功！排版已无缝融合。")
+
+                            # 🌟 核心修改 3：智能判断后端返回的是单文件(PDF)还是多文件包(ZIP)
+                            content_type = res.headers.get("content-type", "")
+                            if "zip" in content_type:
+                                mime_type = "application/zip"
+                                ext = "zip"
+                                final_filename = f"批量修改_{new_title_input}.zip"
+                            else:
+                                mime_type = "application/pdf"
+                                ext = "pdf"
+                                final_filename = f"已修改_{pdf_files[0].name}"
+
+                            st.download_button(
+                                label=f"⬇️ 点击下载处理结果 ({ext.upper()})",
+                                data=res.content,
+                                file_name=final_filename,
+                                mime=mime_type,
+                                type="secondary"
+                            )
+                        else:
+                            st.error(f"❌ 处理失败：{res.json().get('detail', res.text)}")
+                    except Exception as e:
+                        st.error(f"后台接口调用失败: {e}")

@@ -1426,3 +1426,120 @@ async def generate_property_execution(req: PropertyExecutionRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# 🚀 新增接口：PDF 标题批量修改与智能打包 (双轨高度版)
+# ==========================================
+@router.post("/modify_pdf_title_batch", summary="批量修改PDF第一页标题")
+async def modify_pdf_title_batch(
+        files: List[UploadFile] = File(...),  # 👈 接收文件列表
+        mode: str = Form(...),
+        doc_sub_type: str = Form(...),  # 👈 接收报表类别以区分 offset
+        old_title: str = Form(""),
+        new_title: str = Form(...),
+        font_size: int = Form(22),
+        wipe_y0: float = Form(20.0),
+        wipe_y1: float = Form(90.0)
+):
+    try:
+        import fitz
+        import zipfile
+        import io
+        from urllib.parse import quote
+    except ImportError:
+        raise HTTPException(status_code=500, detail="缺失依赖库。请确保执行了 pip install PyMuPDF")
+
+    # 🌟 动态判定 y_offset：汇总表为你测试好的 35.0，明细表这里暂设为 15.0 供你后续测试微调
+    y_offset = 35.0 if doc_sub_type == "汇总表" else 35.0
+
+    processed_files = []  # 用于暂存所有处理完的二进制文件流
+
+    for file in files:
+        try:
+            pdf_bytes = await file.read()
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            page = doc[0]
+            page_w = page.rect.width
+
+            if mode == "auto":
+                if not old_title:
+                    raise HTTPException(status_code=400, detail="智能定位模式下必须提供原标题文字。")
+                rects = page.search_for(old_title)
+                if not rects:
+                    raise HTTPException(status_code=404,
+                                        detail=f"在文件【{file.filename}】中未找到可提取的 '{old_title}'。可能为纯图片，请使用手动盲扫模式。")
+
+                target_rect = rects[0]
+                wipe_rect = fitz.Rect(0, max(0, target_rect.y0 - 5), page_w, target_rect.y1 + 5)
+            else:
+                wipe_rect = fitz.Rect(0, wipe_y0, page_w, wipe_y1)
+
+            # 1. 抹白覆盖
+            page.draw_rect(wipe_rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+
+            # 2. 注入新高度偏移量的文字框
+            text_rect = fitz.Rect(
+                wipe_rect.x0,
+                wipe_rect.y0 + y_offset,  # 👈 使用判定好的专属 offset
+                wipe_rect.x1,
+                wipe_rect.y1 + y_offset + 30
+            )
+
+            # 3. 写入标题
+            try:
+                page.insert_font(fontname="china-s")
+                page.insert_textbox(
+                    text_rect,
+                    new_title,
+                    fontsize=font_size,
+                    fontname="china-s",
+                    align=fitz.TEXT_ALIGN_CENTER,
+                    color=(0, 0, 0)
+                )
+            except Exception as font_e:
+                raise HTTPException(status_code=500, detail=f"字体渲染失败: {str(font_e)}")
+
+            # 输出当前文件字节流并存入列表
+            out_bytes = doc.tobytes()
+            doc.close()
+            # 为避免文件名冲突，在原文件名前加上“已修改_”
+            processed_files.append((f"已修改_{file.filename}", out_bytes))
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"处理【{file.filename}】时发生错误: {str(e)}")
+
+    # ==========================================
+    # 🌟 智能打包下发逻辑 (修复版：解决Chrome拦截问题)
+    # ==========================================
+    from fastapi.responses import Response  # 🌟 核心：引入标准 Response
+
+    # 场景 1：如果用户只上传了 1 个文件，直接返回单份 PDF
+    if len(processed_files) == 1:
+        filename, out_bytes = processed_files[0]
+        return Response(
+            content=out_bytes,  # 直接传递字节流，不使用 io.BytesIO 包装
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename*=utf-8''{quote(filename)}"}
+        )
+
+    # 场景 2：如果上传了多份文件，打包为 ZIP
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for filename, out_bytes in processed_files:
+            zip_file.writestr(filename, out_bytes)
+
+    # 🌟 无需 seek(0)，直接通过 getvalue() 一次性抽出完整二进制数据
+    zip_filename = f"批量修改_{doc_sub_type}_{len(processed_files)}份.zip"
+
+    return Response(
+        content=zip_buffer.getvalue(),  # 直接传递完整的 ZIP 字节流
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename*=utf-8''{quote(zip_filename)}",
+            # 强行附带文件大小，给 Chrome 浏览器吃一颗“定心丸”
+            "Content-Length": str(len(zip_buffer.getvalue()))
+        }
+    )
